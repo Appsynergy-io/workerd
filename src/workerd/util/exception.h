@@ -16,6 +16,11 @@ constexpr kj::Exception::DetailTypeId CPU_LIMIT_DETAIL_ID = 0xfdcb787ba4240576ul
 constexpr kj::Exception::DetailTypeId WALL_TIME_LIMIT_DETAIL_ID = 0x6e8f2b4a1c9d3e5bull;
 // If an exception is thrown for exceeding memory limits, it will contain this detail.
 constexpr kj::Exception::DetailTypeId MEMORY_LIMIT_DETAIL_ID = 0xbaf76dd7ce5bd8cfull;
+// apsy: an exception a Worker's invocation ended with, uncaught, that is the error a limit
+// exception (CPU_LIMIT_DETAIL_ID or MEMORY_LIMIT_DETAIL_ID) of a Worker it called became in its
+// JavaScript, will contain this detail. The caller did not exceed a limit itself, so its own
+// outcome is not a limit's, but the visitor is answered as for one (Error 1102).
+constexpr kj::Exception::DetailTypeId CALLEE_LIMIT_DETAIL_ID = 0x5a1e7c0d3b9f4e21ull;
 // If an exception is thrown for worker killed before start, it will contain this detail.
 const kj::Exception::DetailTypeId SCRIPT_KILLED_DETAIL_ID = 0xf8935d579c20da70;
 

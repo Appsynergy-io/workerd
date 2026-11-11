@@ -117,8 +117,11 @@ class ListenerResponse final: public kj::HttpService::Response {
     uint status;
     kj::StringPtr statusText;
     kj::StringPtr body;
+    // A Worker over its limit behind this one's service binding, its error uncaught here, is
+    // answered as for the limit itself [jsg addCalleeLimitDetail].
     if (exception.getDetail(CPU_LIMIT_DETAIL_ID) != kj::none ||
-        exception.getDetail(MEMORY_LIMIT_DETAIL_ID) != kj::none) {
+        exception.getDetail(MEMORY_LIMIT_DETAIL_ID) != kj::none ||
+        exception.getDetail(CALLEE_LIMIT_DETAIL_ID) != kj::none) {
       error = 1102;
       status = 503;
       statusText = "Service Unavailable"_kj;

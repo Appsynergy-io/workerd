@@ -3197,6 +3197,63 @@ KJ_TEST("Server: a Worker with memoryBytes is held to it, one without is not") {
     Worker exceeded resource limits)"_blockquote);
 }
 
+// AppSynergy: a Worker over its limit behind another's service binding becomes a JavaScript error
+// in the caller, and the caller's uncaught error is answered 1102 as the limit itself would be,
+// not 1101 [https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1102/].
+// The caller has no limits of its own.
+KJ_TEST("Server: a Worker over its CPU limit behind a service binding is answered 1102") {
+  TestServer test(R"((
+    services = [
+      ( name = "caller",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request, env) {
+              `    return await env.SPIN.fetch("http://x/spin");
+              `  }
+              `}
+          )],
+          bindings = [(name = "SPIN", service = "spin")]
+        )
+      ),
+      ( name = "spin",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    for (;;) {}
+              `  }
+              `}
+          )]
+        )
+      )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "caller")]
+  ))"_kj);
+  test.server.setPlatform(R"((
+    services = [(name = "spin", limits = (cpuMs = 10))],
+    cpuRolloverInitialMs = 0
+  ))");
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recv(R"(
+    HTTP/1.1 503 Service Unavailable
+    Content-Length: 31
+    Content-Type: text/plain; charset=utf-8
+    cf-error-type: 1102
+    cf-error-origin: Workers runtime
+
+    Worker exceeded resource limits)"_blockquote);
+}
+
 KJ_TEST("Server: the platform's settings name only the config's Workers") {
   TestServer test(R"((
     services = [

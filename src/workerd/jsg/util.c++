@@ -8,6 +8,7 @@
 #include "setup.h"
 
 #include <workerd/jsg/exception-metadata.capnp.h>
+#include <workerd/util/exception.h>
 
 #include <simdutf.h>
 
@@ -198,6 +199,18 @@ bool setOverloadedError(v8::Isolate* isolate, v8::Local<v8::Value>& exception) {
       isolate->GetCurrentContext(), jsg::v8StrIntern(isolate, "overloaded"_kj), v8::True(isolate)));
 }
 
+// apsy: the private symbol marking a JavaScript error made from a resource-limit exception
+// [addCalleeLimitDetail()]. A private symbol, so no Worker can read, set or forge it.
+static v8::Local<v8::Private> calleeLimitKey(v8::Isolate* isolate) {
+  return v8::Private::ForApi(isolate, v8StrIntern(isolate, "apsy.calleeLimit"_kj));
+}
+
+static bool isLimitException(const kj::Exception& exception) {
+  return exception.getDetail(CPU_LIMIT_DETAIL_ID) != kj::none ||
+      exception.getDetail(MEMORY_LIMIT_DETAIL_ID) != kj::none ||
+      exception.getDetail(CALLEE_LIMIT_DETAIL_ID) != kj::none;
+}
+
 bool setDurableObjectResetError(v8::Isolate* isolate, v8::Local<v8::Value>& exception) {
   KJ_ASSERT(exception->IsObject());
   auto obj = exception.As<v8::Object>();
@@ -282,6 +295,15 @@ DecodedException decodeTunneledException(
 
     if (result.isDurableObjectReset) {
       setDurableObjectResetError(isolate, result.handle);
+    }
+
+    // apsy: a Worker over its CPU or memory limit ends with an exception its service binding's
+    // caller receives as a JavaScript error. Uncaught, that error becomes the caller's exception
+    // again, and the mark lets it carry CALLEE_LIMIT_DETAIL_ID, so the visitor is answered 1102 as
+    // for the limit itself rather than 1101 [addCalleeLimitDetail].
+    if (isLimitException(exception)) {
+      jsg::check(result.handle.As<v8::Object>()->SetPrivate(
+          isolate->GetCurrentContext(), calleeLimitKey(isolate), v8::True(isolate)));
     }
 
     KJ_IF_SOME(durableObjectId, getDurableObjectId(exception)) {
@@ -485,6 +507,16 @@ void throwInternalError(
     KJ_LOG(ERROR, "error rendering exception", renderingError);
     KJ_LOG(ERROR, exception);
     throwInternalError(isolate, "error rendering exception");
+  }
+}
+
+void addCalleeLimitDetail(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle) {
+  if (!handle->IsObject()) return;
+  auto marked = handle.As<v8::Object>()->GetPrivate(
+      js.v8Isolate->GetCurrentContext(), calleeLimitKey(js.v8Isolate));
+  v8::Local<v8::Value> value;
+  if (marked.ToLocal(&value) && value->IsTrue()) {
+    exception.setDetail(CALLEE_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
   }
 }
 

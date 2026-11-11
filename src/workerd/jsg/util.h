@@ -112,6 +112,10 @@ constexpr kj::Exception::DetailTypeId DURABLE_OBJECT_EXCEPTION_METADATA_DETAIL_I
 // Add a serialized copy of the exception value to the KJ exception, as a "detail".
 void addExceptionDetail(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle);
 
+// apsy: when `handle` is the error a resource-limit exception became in JavaScript, marks
+// `exception`, made from it again, with CALLEE_LIMIT_DETAIL_ID [workerd/util/exception.h].
+void addCalleeLimitDetail(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle);
+
 // Extract and add JavaScript exception metadata (error type and stack trace) to the KJ exception.
 // Serializes using Cap'n Proto schema defined in exception-metadata.capnp.
 void addJsExceptionMetadata(Lock& js, kj::Exception& exception, v8::Local<v8::Value> handle);

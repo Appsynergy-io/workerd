@@ -1484,6 +1484,7 @@ class ExceptionWrapper {
 
     addExceptionDetail(js, result, handle);
     addJsExceptionMetadata(js, result, handle);
+    addCalleeLimitDetail(js, result, handle);
     return result;
   }
 };
