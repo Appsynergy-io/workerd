@@ -194,6 +194,7 @@ pub fn compile_bindings(
     worker: worker::Reader<'_>,
     actor_configs: &ActorConfigs,
     local_actor_configs: &ActorConfigMap,
+    environment: &HashMap<String, String>,
     experimental: bool,
 ) -> capnp::Result<CompiledBindings> {
     let mut compiler = Compiler {
@@ -201,6 +202,7 @@ pub fn compile_bindings(
         service_worker_script: worker.has_service_worker_script(),
         actor_configs,
         local_actor_configs,
+        environment,
         experimental,
         out: CompiledBindings::default(),
     };
@@ -358,6 +360,8 @@ struct Compiler<'a> {
     service_worker_script: bool,
     actor_configs: &'a ActorConfigs,
     local_actor_configs: &'a ActorConfigMap,
+    /// `--environment-fd`'s records, which `fromEnvironment` reads before the process environment.
+    environment: &'a HashMap<String, String>,
     experimental: bool,
     out: CompiledBindings,
 }
@@ -443,10 +447,16 @@ impl Compiler<'_> {
                 global.set_queue(channel);
             }
             Which::Wrapped(wrapped) => return self.wrapped(wrapped?, global),
-            Which::FromEnvironment(variable) => match env::var_os(variable?.to_str()?) {
-                Some(value) => global.set_text(&*value.to_string_lossy()),
-                None => global.set_json("null"),
-            },
+            Which::FromEnvironment(variable) => {
+                let variable = variable?.to_str()?;
+                match self.environment.get(variable) {
+                    Some(value) => global.set_text(value.as_str()),
+                    None => match env::var_os(variable) {
+                        Some(value) => global.set_text(&*value.to_string_lossy()),
+                        None => global.set_json("null"),
+                    },
+                }
+            }
             Which::AnalyticsEngine(designator) => {
                 if !self.experimental_feature("AnalyticsEngine") {
                     return Ok(false);

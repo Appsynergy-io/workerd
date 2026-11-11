@@ -463,6 +463,9 @@ pub struct Overrides {
     pub opened_directories: HashMap<String, std::fs::File>,
     /// `--external-addr`: an external service's address.
     pub externals: HashMap<String, String>,
+    /// `--environment-fd`: the records a `fromEnvironment` binding reads before the process
+    /// environment, by name (cli/environment.rs).
+    pub environment: HashMap<String, String>,
 }
 
 /// One named service of the config.
@@ -1844,6 +1847,7 @@ async fn make_service(
                 index,
                 worker,
                 actor_configs,
+                &overrides.environment,
                 inbound_listeners,
                 report,
             )

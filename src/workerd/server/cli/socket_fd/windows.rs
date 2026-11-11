@@ -87,3 +87,16 @@ pub fn read_descriptor(_fd: u32, _max_bytes: usize) -> io::Result<Vec<u8>> {
         "--platform-config-fd is implemented on Unix only",
     ))
 }
+
+/// `--environment-fd`: Unix only, since its point is to keep the values out of
+/// `/proc/<pid>/environ`.
+pub fn read_environment(
+    _fd: u32,
+    _max_bytes: usize,
+    _shared_with_control: bool,
+) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "--environment-fd is implemented on Unix only",
+    ))
+}

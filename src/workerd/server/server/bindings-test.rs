@@ -23,11 +23,21 @@ fn compile(
     actor_configs: &ActorConfigs,
     experimental: bool,
 ) -> CompiledBindings {
+    compile_with_environment(message, actor_configs, &HashMap::new(), experimental)
+}
+
+fn compile_with_environment(
+    message: &message::Builder<HeapAllocator>,
+    actor_configs: &ActorConfigs,
+    environment: &HashMap<String, String>,
+    experimental: bool,
+) -> CompiledBindings {
     compile_bindings(
         "main",
         message.get_root_as_reader::<worker::Reader>().unwrap(),
         actor_configs,
         &actor_configs["main"],
+        environment,
         experimental,
     )
     .unwrap()
@@ -332,6 +342,36 @@ fn wrapped_bindings_share_the_channel_tables() {
             designator("inner-svc"),
             designator("taken-svc"),
             designator("after-svc"),
+        ]
+    );
+}
+
+#[test]
+fn from_environment_reads_the_records_before_the_process_environment() {
+    let message = worker_message(3, |mut bindings| {
+        let mut secret = bindings.reborrow().get(0);
+        secret.set_name("SECRET");
+        secret.set_from_environment("APSY_TEST_SECRET");
+        // PATH is in the process environment too; the record still wins.
+        let mut path = bindings.reborrow().get(1);
+        path.set_name("SHADOWED");
+        path.set_from_environment("PATH");
+        let mut missing = bindings.get(2);
+        missing.set_name("MISSING");
+        missing.set_from_environment("APSY_TEST_NOT_SET_ANYWHERE");
+    });
+    let environment = HashMap::from([
+        ("APSY_TEST_SECRET".to_owned(), "s3cret".to_owned()),
+        ("PATH".to_owned(), "from-record".to_owned()),
+    ]);
+    let compiled = compile_with_environment(&message, &no_actors(), &environment, false);
+    assert!(compiled.errors.is_empty(), "{:?}", compiled.errors);
+    assert_eq!(
+        rendered(&compiled.globals),
+        [
+            "(name = \"SECRET\", text = \"s3cret\")",
+            "(name = \"SHADOWED\", text = \"from-record\")",
+            "(name = \"MISSING\", json = \"null\")",
         ]
     );
 }

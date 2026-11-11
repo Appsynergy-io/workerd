@@ -93,6 +93,43 @@ pub fn read_descriptor(fd: u32, max_bytes: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// `--environment-fd`: what `fd` holds, read to its end, at most `max_bytes` (more is an error).
+/// The descriptor is then closed, or, when `shared_with_control`, shut down for reading and left
+/// open for `--control-fd`'s events.
+pub fn read_environment(
+    fd: u32,
+    max_bytes: usize,
+    shared_with_control: bool,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::BorrowedFd;
+    use std::os::fd::FromRawFd;
+
+    let raw = i32::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
+    // SAFETY: borrowed only while it is duplicated, which fails with EBADF if `raw` is not open.
+    let inherited = unsafe { BorrowedFd::borrow_raw(raw) };
+    let mut file = std::fs::File::from(inherited.try_clone_to_owned()?);
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    (&mut file).take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("holds more than {max_bytes} bytes"),
+        ));
+    }
+    if shared_with_control {
+        socket2::SockRef::from(&file).shutdown(std::net::Shutdown::Read)?;
+    } else {
+        // SAFETY: the descriptor the command line named, which nothing else in this process uses
+        // once its records are read; the duplicate is closed when `file` drops.
+        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+    }
+    Ok(bytes)
+}
+
 /// Whether the socket is listening, or `None` where the OS cannot say (macOS has no
 /// `SO_ACCEPTCONN`; the server finds out at the first `accept()`).
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]

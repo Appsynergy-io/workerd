@@ -18,6 +18,7 @@ mod bridge;
 mod config;
 mod deploy;
 mod deployments;
+mod environment;
 mod platform;
 mod process;
 mod sandbox;
@@ -655,11 +656,21 @@ fn serve_options<T: CommandFactory>(
         &serve.platform_config_fd,
         serve_or_test,
     );
+    let environment = match serve.environment_fd[..] {
+        [] => std::collections::HashMap::new(),
+        [_, _, ..] => usage_error::<T>("--environment-fd is given more than once"),
+        [_] if serve_or_test.watch => usage_error::<T>(
+            "--environment-fd and --watch cannot be combined: a restart could not read the \
+             records again.",
+        ),
+        [fd] => environment::read(fd, serve.control_fd)
+            .unwrap_or_else(|error| usage_error::<T>(format!("--environment-fd={fd}: {error}"))),
+    };
     let control = serve.control_fd.map(|fd| {
         socket_fd::control_file(fd)
             .unwrap_or_else(|error| usage_error::<T>(format!("--control-fd={fd}: {error}")))
     });
-    let options = RunOptions {
+    let mut options = RunOptions {
         socket_addresses: args::override_map(serve.socket_addr_overrides),
         socket_fds,
         control,
@@ -669,6 +680,7 @@ fn serve_options<T: CommandFactory>(
         platform,
         ..run_options(serve_or_test)
     };
+    options.overrides.environment = environment;
     (options, inherited)
 }
 

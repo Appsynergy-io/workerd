@@ -413,6 +413,14 @@ pub struct ServeArgs {
     #[arg(long, value_name = "fd", value_parser = parse_control_fd)]
     pub platform_config_fd: Vec<u32>,
 
+    /// Read `NAME=value` records, each ended by a NUL byte, from descriptor <fd> to its end (at most
+    /// 4 MiB) before the config: a `fromEnvironment` binding takes its name's value among them
+    /// before the process environment's. The descriptor is then closed, or shut down for reading
+    /// when it is also --control-fd's. Given at most once. Not compatible with --watch, whose
+    /// restart could not read them again.
+    #[arg(long, value_name = "fd", value_parser = parse_fd)]
+    pub environment_fd: Vec<u32>,
+
     /// Bind the cluster's peer port to <addr> instead of the config's `cluster.address`. The
     /// port gives full access to every service in the process to holders of the cluster key, and
     /// its traffic is not encrypted: only the cluster's instances should reach it, on a private
@@ -689,6 +697,12 @@ fn parse_bench_filter(param: &str) -> Result<BenchFilter, &'static str> {
         parse_test_filter(rest)?
     };
     Ok(BenchFilter { test, case_pattern })
+}
+
+fn parse_fd(param: &str) -> Result<u32, &'static str> {
+    param
+        .parse()
+        .map_err(|_| "Value must be a file descriptor (non-negative integer).")
 }
 
 fn parse_control_fd(param: &str) -> Result<u32, &'static str> {

@@ -68,6 +68,8 @@ fn serve_options() {
         "--socket-addr",
         "http=*:8080",
         "--control-fd=3",
+        "--environment-fd=3",
+        "--sandbox",
         "--inspector-addr=127.0.0.1:9229",
         "--inspector-addr=127.0.0.1:9230",
         "--async-trace=trace.ndjson",
@@ -95,6 +97,8 @@ fn serve_options() {
     assert_eq!(serve_or_test.async_trace_stacks, Some(8));
     assert!(serve_or_test.async_trace_promises);
     assert_eq!(serve.control_fd, Some(3));
+    assert_eq!(serve.environment_fd, [3]);
+    assert!(serve.sandbox);
     assert_eq!(serve.cluster_address.as_deref(), Some("0.0.0.0:7000"));
     assert_eq!(serve.cluster_advertise.as_deref(), Some("10.0.0.4:7000"));
     assert_eq!(
@@ -211,6 +215,8 @@ fn bad_values_are_usage_errors() {
         &["serve", "c.capnp", "--socket-addr=noequals"][..],
         &["serve", "c.capnp", "--socket-fd=http=abc"],
         &["serve", "c.capnp", "--control-fd=-1"],
+        &["serve", "c.capnp", "--environment-fd=-1"],
+        &["serve", "c.capnp", "--environment-fd=x"],
         &["serve"],
         &["test", "c.capnp", "a", "b"],
         &["unknown"],

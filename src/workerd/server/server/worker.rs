@@ -12,6 +12,7 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ptr;
 use std::rc::Rc;
@@ -157,6 +158,7 @@ impl WorkerService {
         service_index: u32,
         conf: worker::Reader<'_>,
         actor_configs: &ActorConfigs,
+        environment: &HashMap<String, String>,
         inbound_listeners: Vec<ffi::InboundListener>,
         report: &Reporter,
     ) -> Result<Rc<Self>> {
@@ -164,9 +166,15 @@ impl WorkerService {
         let empty = ActorConfigMap::new();
         let local_actor_configs = actor_configs.get(name).unwrap_or(&empty);
 
-        let mut bindings =
-            compile_bindings(name, conf, actor_configs, local_actor_configs, experimental)
-                .map_err(capnp_error)?;
+        let mut bindings = compile_bindings(
+            name,
+            conf,
+            actor_configs,
+            local_actor_configs,
+            environment,
+            experimental,
+        )
+        .map_err(capnp_error)?;
         for error in std::mem::take(&mut bindings.errors) {
             report.service_error(name, error);
         }
