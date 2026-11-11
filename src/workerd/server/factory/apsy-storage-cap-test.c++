@@ -99,5 +99,21 @@ KJ_TEST("the key-value API on the same database is refused past the cap, as the 
   KJ_EXPECT(pageBytes(db) <= CAP, pageBytes(db));
   KJ_EXPECT(kv.delete_("key0"));
 }
+
+KJ_TEST("a put() that must first make the key-value table is refused past the cap too") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*dir);
+  SqliteDatabase db(vfs, kj::Path({"object"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  db.run("PRAGMA journal_mode=WAL;");
+  db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);");
+  // Every page the database may hold is taken before _cf_KV exists.
+  capDatabaseSize(db, 1);
+  SqliteKv kv(db);
+  auto value = kj::heapArray<byte>(16, 'v');
+  auto e = KJ_ASSERT_NONNULL(kj::runCatchingExceptions([&]() { kv.put("key", value.asPtr()); }),
+      "the put was not refused");
+  KJ_EXPECT(e.getDescription().contains("jsg.Error: database or disk is full: SQLITE_FULL"), e);
+}
+
 }  // namespace
 }  // namespace workerd::server::apsy

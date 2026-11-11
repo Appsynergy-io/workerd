@@ -23,6 +23,16 @@ class SqliteKvRegulator: public SqliteDatabase::Regulator {
   }
 };
 
+// AppSynergy: creating the `_cf_KV` table, which the first put() into an object does. It errs as
+// a put() does, so an object held at its storage limit (server/factory/apsy-storage-cap.h)
+// refuses that put() with `database or disk is full: SQLITE_FULL` rather than an internal error,
+// and, like the TRUSTED regulator it replaces there, it is not billed.
+class SqliteKvTableRegulator: public SqliteKvRegulator {
+  bool shouldAddQueryStats() const override {
+    return false;
+  }
+};
+
 // Class which implements KV storage on top of SQLite. This is intended to be used for Durable
 // Object storage.
 //

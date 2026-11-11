@@ -68,7 +68,8 @@ void SqliteKv::cancelCurrentCursor() {
 
 SqliteKv::Initialized& SqliteKv::ensureInitialized(bool allowUnconfirmed) {
   if (!tableCreated) {
-    db.run(SqliteDatabase::QueryOptions{.regulator = SqliteDatabase::TRUSTED,
+    static constexpr SqliteKvTableRegulator tableRegulator;
+    db.run(SqliteDatabase::QueryOptions{.regulator = tableRegulator,
              .allowUnconfirmed = allowUnconfirmed},
         R"(
       CREATE TABLE IF NOT EXISTS _cf_KV (
