@@ -25,6 +25,7 @@ fn a_service_with_limits_has_them_and_one_without_has_none() {
         })
     );
     assert_eq!(platform.service("plain").unwrap().limits, None);
+    assert!(!platform.is_lazy("limited"));
     assert!(platform.service("absent").is_none());
 }
 
@@ -76,6 +77,37 @@ fn without_settings_nothing_is_named_and_nothing_is_limited() {
     assert!(platform.words().is_empty());
     assert!(platform.service("main").is_none());
     assert_eq!(platform.max_queued_requests(), None);
+    assert_eq!(platform.isolate_memory_budget(), 0);
+    assert_eq!(platform.malloc_soft_limit(), 0);
+}
+
+#[test]
+fn a_lazy_worker_and_the_memory_settings_are_read() {
+    let platform = Platform::decode(encoded(|mut p| {
+        p.set_isolate_memory_budget(1 << 30);
+        p.set_malloc_soft_limit(2 << 30);
+        let mut service = p.init_services(1).get(0);
+        service.set_name("lazy");
+        service.set_lazy(true);
+    }))
+    .unwrap();
+    assert!(platform.is_lazy("lazy"));
+    assert_eq!(platform.isolate_memory_budget(), 1 << 30);
+    assert_eq!(platform.malloc_soft_limit(), 2 << 30);
+    assert_eq!(platform.lazy_worker_estimate_bytes(), 4 << 20);
+    assert_eq!(platform.lazy_idle(), std::time::Duration::from_secs(2));
+    assert_eq!(platform.lazy_sweep(), std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn the_lazy_idle_threshold_and_sweep_interval_are_read() {
+    let platform = Platform::decode(encoded(|mut p| {
+        p.set_lazy_idle_ms(5000);
+        p.set_lazy_sweep_ms(250);
+    }))
+    .unwrap();
+    assert_eq!(platform.lazy_idle(), std::time::Duration::from_secs(5));
+    assert_eq!(platform.lazy_sweep(), std::time::Duration::from_millis(250));
 }
 
 #[test]

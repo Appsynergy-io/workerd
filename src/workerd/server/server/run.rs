@@ -17,6 +17,7 @@ use futures::StreamExt;
 use futures::future::Either;
 use futures::future::FusedFuture;
 use futures::future::LocalBoxFuture;
+use futures::future::RemoteHandle;
 use futures::stream::FuturesUnordered;
 use kj_rs::KjMaybe;
 use tokio::sync::watch;
@@ -40,6 +41,7 @@ use crate::config::Factory;
 use crate::config::Overrides;
 use crate::config::Reporter;
 use crate::config::Server;
+use crate::config::Service;
 use crate::config::capnp_error;
 use crate::config::text;
 use crate::listen;
@@ -49,6 +51,7 @@ use crate::listen::ListenContext;
 use crate::listen::StreamListener;
 use crate::listen::TcpTls;
 use crate::log;
+use crate::memory::ResidentMemory;
 use crate::platform::Platform;
 use crate::services::network::tls_options;
 use crate::services::rewriter::HttpRewriter;
@@ -85,6 +88,9 @@ pub struct RunOptions {
     /// The config's errors the command line found before the server existed (`--sandbox`'s),
     /// reported with the server's.
     pub config_errors: Vec<String>,
+    /// `/proc/self/status`, opened by `--sandbox` before the filesystem went away, which the
+    /// sweep of the workers built on demand reads its resident memory through (memory.rs).
+    pub process_status: Option<std::fs::File>,
 }
 
 /// The control channel (`--control-fd`), written line by line; a failed write is logged. The
@@ -125,6 +131,15 @@ impl Control {
         Ok(())
     }
 
+    /// A worker built on demand was built or given up (lazy.rs).
+    fn lazy_worker(&self, service: &str, state: &str) {
+        let service = serde_json::Value::from(service);
+        let state = serde_json::Value::from(state);
+        self.write(&format!(
+            "{{\"event\":\"lazy-worker\",\"service\":{service},\"state\":{state}}}\n"
+        ));
+    }
+
     /// A service's config error, a startup exception among them: a stream no Worker's console
     /// output reaches, in the shape of the `listen` events.
     fn service_error(&self, service: &str, error: &str) {
@@ -143,6 +158,9 @@ struct Running {
     /// The listener futures; each ends when the server has drained, or fails fatally.
     listeners: FuturesUnordered<LocalBoxFuture<'static, Result<()>>>,
     drain: watch::Sender<bool>,
+    /// The sweep of the workers built on demand past `isolateMemoryBudget` (lazy.rs), while
+    /// `workerd serve` serves; dropping it ends the sweep, at the drain.
+    sweep: Option<RemoteHandle<()>>,
 }
 
 /// Binds the sockets, starts the inspector, builds the service graph, and starts the listeners.
@@ -163,6 +181,10 @@ async fn start(
         report.forward_service_errors(Box::new(move |service, error| {
             errors.service_error(service, error);
         }));
+        let events = Rc::clone(&control);
+        report.forward_lazy_worker_events(Box::new(move |service, state| {
+            events.lazy_worker(service, state);
+        }));
     }
     // The platform's settings, before any worker is compiled: its limits are the isolate's.
     let platform = match options.platform.take() {
@@ -171,6 +193,8 @@ async fn start(
     };
     platform.check_against(config, &report)?;
     factory.set_platform(platform)?;
+    // Before any worker is built, so that their allocations are held to it from the first.
+    ffi::factory_apply_malloc_soft_limit(factory.platform().malloc_soft_limit());
 
     for error in std::mem::take(&mut options.config_errors) {
         report.error(error);
@@ -292,10 +316,23 @@ async fn start(
         )));
     }
 
+    let platform = factory.platform();
+    let budget = platform.isolate_memory_budget();
+    let sweep = (!for_test && budget > 0 && server.lazy_workers().next().is_some()).then(|| {
+        factory.spawn(crate::lazy::sweep(
+            Rc::downgrade(&server),
+            budget,
+            platform.lazy_worker_estimate_bytes(),
+            platform.lazy_sweep(),
+            ResidentMemory::new(options.process_status.take()),
+        ))
+    });
+
     Ok(Some(Running {
         server,
         listeners,
         drain,
+        sweep,
     }))
 }
 
@@ -482,6 +519,7 @@ pub async fn run(
         server,
         mut listeners,
         drain: draining,
+        sweep,
     }) = start(factory, options, report, false).await?
     else {
         return Ok(());
@@ -496,6 +534,8 @@ pub async fn run(
     match futures::future::select(serving.as_mut(), drain).await {
         Either::Left((result, _)) => result?,
         Either::Right(((), _)) => {
+            // Nothing is given up while the last requests drain.
+            drop(sweep);
             // A draining instance claims nothing more and hands its clustered objects off,
             // `preventEviction` or not, while it serves on: a request for one waits for it and
             // then goes where it runs next. Then it leaves the cluster, so peers take over what
@@ -618,11 +658,16 @@ async fn start_local(
         if !services.matches(name) {
             continue;
         }
-        let Some(worker) = service.as_worker() else {
-            continue;
+        // A lazy worker's handlers are known once it is built (lazy.rs).
+        let worker = match service {
+            Service::Lazy(lazy) => lazy.built().await?,
+            _ => match service.as_worker() {
+                Some(worker) => Rc::clone(worker),
+                None => continue,
+            },
         };
         if worker.has_handler(None, handler) && entrypoints.matches("default") {
-            targets.push((service.channel(), name.to_owned()));
+            targets.push((worker.default_entrypoint(), name.to_owned()));
         }
         for entrypoint in worker.entrypoint_names() {
             if entrypoints.matches(entrypoint)

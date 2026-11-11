@@ -42,6 +42,31 @@ struct Platform {
   # object's own alarms and hibernated WebSocket events are not counted. 0: no limit. Without
   # settings the queue is unbounded, as upstream's.
 
+  isolateMemoryBudget @4 :UInt64;
+  # Bytes of resident memory past which the Workers this process built on demand
+  # (`Service.lazy`) are given up while idle, least recently used first; the next request to one
+  # builds it again. 0: none is given up.
+
+  mallocSoftLimit @5 :UInt64;
+  # Bytes the allocator (tcmalloc) holds itself to: memory it has freed past this is returned to
+  # the system as it allocates, and at a steady rate from a background thread, and a Worker with
+  # `limits` leaving JavaScript while the process is over it is told to collect. 0: the
+  # allocator's own behaviour.
+
+  lazyWorkerEstimateBytes @6 :UInt64 = 4194304;
+  # What giving up one idle lazy Worker is counted to free when the process is over
+  # `isolateMemoryBudget`, in bytes. Cloudflare publishes no such figure; the default, 4 MiB, is
+  # the platform's own, measured as what one isolate holds before its first request.
+
+  lazyIdleMs @7 :UInt32 = 2000;
+  # A built lazy Worker asked for this recently, in milliseconds, is not idle, and is not given up:
+  # giving it up would cost its next request a build at once. The default, 2 s, is the platform's
+  # own.
+
+  lazySweepMs @8 :UInt32 = 1000;
+  # How often, in milliseconds, the process compares its resident memory with
+  # `isolateMemoryBudget` and gives idle lazy Workers up. The default, 1 s, is the platform's own.
+
   struct Service {
     name @0 :Text;
     # The service's name in the config.
@@ -62,6 +87,13 @@ struct Platform {
     # `allowedExperimentalFlags`. A flag not listed here is refused as upstream refuses it without
     # `--experimental`; one listed that the Worker does not enable has no effect. With
     # `--experimental` every such flag is admitted, as upstream. Unset: none.
+
+    lazy @4 :Bool;
+    # The Worker is built when first asked for, not when the process starts: its isolate, its
+    # script and its bindings' links. While idle it may be given up past `isolateMemoryBudget`,
+    # and the next request builds it again. A lazy Worker defines no Durable Object namespace and
+    # runs no Workflow, since those are wired before any request. Under the inspector every
+    # Worker is built at start.
   }
 
   struct Limits {

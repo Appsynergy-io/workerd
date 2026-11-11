@@ -183,6 +183,9 @@ const kj::HttpHeaderTable& factory_header_table(const WorkerFactory& factory);
 bool factory_experimental(const WorkerFactory& factory);
 bool factory_tail_workers(const WorkerFactory& factory);
 void factory_set_platform(const WorkerFactory& factory, ::rust::Slice<const uint64_t> platform);
+bool factory_has_inspector(const WorkerFactory& factory);
+void factory_apply_malloc_soft_limit(uint64_t bytes);
+void factory_release_memory_to_system(size_t bytes);
 void factory_set_server(const WorkerFactory& factory, ::rust::Box<ServerHandle> server);
 void factory_spawn(const WorkerFactory& factory, ::rust::Box<SpawnedTask> task);
 void factory_clear_tasks(const WorkerFactory& factory);
@@ -214,6 +217,7 @@ class CompiledWorker final {
 WorkerInfo worker_info(const CompiledWorker& worker);
 void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
 void worker_unlink(const CompiledWorker& worker);
+bool worker_has_background_work(const CompiledWorker& worker);
 void worker_rebuild(const CompiledWorker& worker);
 bool worker_condemned(const CompiledWorker& worker);
 bool worker_rebuildable(const CompiledWorker& worker);

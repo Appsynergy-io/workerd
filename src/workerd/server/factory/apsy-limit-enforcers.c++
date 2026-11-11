@@ -6,6 +6,7 @@
 #include <workerd/io/tracked-wasm-instance.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/server/factory/apsy-limits.h>
+#include <workerd/server/factory/apsy-memory.h>
 #include <workerd/util/exception.h>
 
 #include <pthread.h>
@@ -497,6 +498,7 @@ class LimitedIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   void completedRequest(kj::StringPtr id) const override {}
 
   bool exitJs(jsg::Lock& lock) const override {
+    apsy::collectUnderMallocPressure(lock);
     return false;
   }
 

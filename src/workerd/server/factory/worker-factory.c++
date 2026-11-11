@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "apsy-limit-enforcers.h"
+#include "apsy-memory.h"
 #include "worker-factory-impl.h"
 
 #include <workerd/api/analytics-engine.capnp.h>
@@ -268,6 +269,18 @@ void factory_set_platform(const WorkerFactory& factory, ::rust::Slice<const uint
   auto words = kj::heapArray<capnp::word>(platform.size());
   memcpy(words.begin(), platform.data(), platform.size() * sizeof(uint64_t));
   impl.platform = kj::heap<WorkerFactory::Impl::PlatformMessage>(kj::mv(words));
+}
+
+bool factory_has_inspector(const WorkerFactory& factory) {
+  return factory.getImpl().inspectorRegistrar != kj::none;
+}
+
+void factory_apply_malloc_soft_limit(uint64_t bytes) {
+  apsy::applyMallocSoftLimit(bytes);
+}
+
+void factory_release_memory_to_system(size_t bytes) {
+  apsy::releaseMemoryToSystem(bytes);
 }
 
 Worker::Actor::Id normalizeActorId(Worker::Actor::Id id) {
@@ -1966,6 +1979,10 @@ bool worker_condemned(const CompiledWorker& worker) {
 
 bool worker_rebuildable(const CompiledWorker& worker) {
   return worker.getImpl().rebuildable;
+}
+
+bool worker_has_background_work(const CompiledWorker& worker) {
+  return !worker.getImpl().waitUntilTasks.isEmpty();
 }
 
 void worker_unlink(const CompiledWorker& worker) {

@@ -553,6 +553,12 @@ impl WorkerService {
         &self.rebuild
     }
 
+    /// Whether nothing runs in the worker beyond the requests its caller counts: no background
+    /// work past a response and no rebuild. A lazy worker is given up only then (lazy.rs).
+    pub fn is_quiescent(&self) -> bool {
+        !ffi::worker_has_background_work(&self.worker) && !self.rebuild.in_progress()
+    }
+
     /// Resolves once the worker can take a new request or construct a new actor: at once, or
     /// when the build that replaces a condemned isolate ends (`rebuild.rs`).
     pub async fn when_ready(self: &Rc<Self>) -> Result<()> {

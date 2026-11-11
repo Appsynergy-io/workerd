@@ -55,6 +55,7 @@ use crate::channels::SubrequestChannel;
 use crate::channels::TokenUsage;
 use crate::channels::WorkerInterface;
 use crate::cluster::ClusterNode;
+use crate::lazy::LazyWorkerService;
 use crate::listen::loopback::Loopback;
 use crate::loader::WorkerLoaderNamespace;
 use crate::platform::Platform;
@@ -192,6 +193,9 @@ pub struct Reporter {
     /// Where each service error also goes, as the service's name and the error
     /// (`forward_service_errors`).
     service_errors: RefCell<Option<Box<dyn Fn(&str, &str)>>>,
+    /// Where a worker built on demand reports being built or given up, as the service's name and
+    /// the state (`forward_lazy_worker_events`).
+    lazy_worker_events: RefCell<Option<Box<dyn Fn(&str, &str)>>>,
 }
 
 /// Tracks which services came from cluster deployments.
@@ -232,6 +236,20 @@ impl Reporter {
             broken: RefCell::new(BTreeMap::new()),
             node_services: RefCell::default(),
             service_errors: RefCell::new(None),
+            lazy_worker_events: RefCell::new(None),
+        }
+    }
+
+    /// Sends every later lazy worker's state change to `sink`: `--control-fd`'s `lazy-worker`
+    /// event (run.rs `Control`, lazy.rs).
+    pub fn forward_lazy_worker_events(&self, sink: Box<dyn Fn(&str, &str)>) {
+        *self.lazy_worker_events.borrow_mut() = Some(sink);
+    }
+
+    /// A worker built on demand was `"built"` or `"evicted"` (lazy.rs).
+    pub fn lazy_worker(&self, service: &str, state: &str) {
+        if let Some(sink) = &*self.lazy_worker_events.borrow() {
+            sink(service, state);
         }
     }
 
@@ -471,6 +489,8 @@ pub struct Overrides {
 /// One named service of the config.
 pub enum Service {
     Worker(Rc<WorkerService>),
+    /// A worker built on demand (apsy.capnp `Platform.Service.lazy`, lazy.rs).
+    Lazy(Rc<LazyWorkerService>),
     /// An external server or a network: a channel and nothing more. A service whose config was
     /// rejected (the error was reported) is an [`InvalidConfigChannel`], which stands in so that
     /// the rest of the config can be checked.
@@ -484,6 +504,7 @@ impl Service {
     pub fn channel(&self) -> Rc<dyn Channel> {
         match self {
             Self::Worker(worker) => worker.default_entrypoint(),
+            Self::Lazy(lazy) => lazy.entrypoint(None, None, false),
             Self::Leaf(channel) => Rc::clone(channel),
             Self::Disk(disk) => Rc::clone(disk) as Rc<dyn Channel>,
         }
@@ -493,6 +514,14 @@ impl Service {
     pub fn as_worker(&self) -> Option<&Rc<WorkerService>> {
         match self {
             Self::Worker(worker) => Some(worker),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_lazy(&self) -> Option<&Rc<LazyWorkerService>> {
+        match self {
+            Self::Lazy(lazy) => Some(lazy),
             _ => None,
         }
     }
@@ -591,6 +620,9 @@ impl Drop for Services {
         for worker in self.0.values().filter_map(Service::as_worker) {
             worker.unlink();
         }
+        for lazy in self.0.values().filter_map(Service::as_lazy) {
+            lazy.evict();
+        }
     }
 }
 
@@ -634,6 +666,11 @@ impl Server {
             .0
             .iter()
             .map(|(name, service)| (name.as_str(), service))
+    }
+
+    /// Every worker built on demand, in config order (lazy.rs).
+    pub(crate) fn lazy_workers(&self) -> impl Iterator<Item = &Rc<LazyWorkerService>> {
+        self.services.0.values().filter_map(Service::as_lazy)
     }
 
     /// Every worker service, in config order.
@@ -1330,6 +1367,10 @@ pub fn lookup_service(
     };
     let props = configured_props(props_json.as_deref());
 
+    if let Service::Lazy(lazy) = service {
+        // Whether the worker exports the entrypoint is known once it is built (lazy.rs).
+        return lazy.entrypoint(entrypoint.as_deref(), Some(props), false);
+    }
     let Service::Worker(worker) = service else {
         if let Some(entrypoint) = entrypoint {
             report.reference_error(
@@ -1408,6 +1449,18 @@ pub fn lookup_actor_class(
     };
     let props = configured_props(props_json.as_deref());
 
+    if let Service::Lazy(_) = service {
+        report.reference_error(
+            referrer,
+            target,
+            format!(
+                "{context} refers to service \"{target}\" as a Durable Object class, but \
+                 \"{target}\" is lazy: a lazy Worker is built on its first request, after the \
+                 classes are wired."
+            ),
+        );
+        return Rc::new(InvalidConfigActorClass);
+    }
     let Service::Worker(worker) = service else {
         if let Some(entrypoint) = entrypoint {
             report.reference_error(
@@ -1566,9 +1619,12 @@ impl Server {
         let handle = Box::new(ServerHandle(Rc::downgrade(&server)));
         ffi::factory_set_server(server.factory.raw(), handle);
 
-        // Third pass: the links.
+        // Third pass: the links. A lazy worker is linked by each build (lazy.rs).
         for (name, worker) in server.workers() {
             tolerate_deployment(&server.report, name, server.link_worker(name, worker))?;
+        }
+        for lazy in server.lazy_workers() {
+            lazy.set_server(&server);
         }
 
         // A deployment's service with errors fails every request.
@@ -1583,10 +1639,20 @@ impl Server {
 
     /// Resolves everything `worker`'s config names into its channel table.
     fn link_worker(self: &Rc<Self>, name: &str, worker: &Rc<WorkerService>) -> Result<()> {
+        self.link_worker_with(name, worker, &self.report)
+    }
+
+    /// [`Self::link_worker`] reporting to `report`: a lazy worker's build, whose errors fail the
+    /// request that asked for it rather than the process's start (lazy.rs).
+    pub(crate) fn link_worker_with(
+        self: &Rc<Self>,
+        name: &str,
+        worker: &Rc<WorkerService>,
+        report: &Reporter,
+    ) -> Result<()> {
         let Some(pending) = worker.take_pending_link() else {
             return Err(kj::failed!("service \"{name}\" was already linked"));
         };
-        let report = &self.report;
         let services = &self.services.0;
         let lookup =
             |designator: &Designator| lookup_service(services, report, Some(name), designator);
@@ -1608,7 +1674,7 @@ impl Server {
         // The access binding's entrypoint is a template: its props are each request's identity.
         let mut access_binding_channel = None;
         if let Some(designator) = &pending.access_binding
-            && let Some(channel) = self.access_binding(name, designator)?
+            && let Some(channel) = self.access_binding(name, designator, report)?
         {
             access_binding_channel = Some(len_u32(&subrequest));
             subrequest.push(channel);
@@ -1638,7 +1704,7 @@ impl Server {
 
         let storage_path = self.storage_path(name, pending.storage.as_deref());
 
-        let tail = |designator: &Designator| self.tail(name, designator);
+        let tail = |designator: &Designator| self.tail(name, designator, report);
         let mut tails: Vec<_> = pending.tails.iter().filter_map(tail).collect();
         let mut streaming_tails: Vec<_> = pending.streaming_tails.iter().filter_map(tail).collect();
         // Without tail workers, the tails are only looked up, for their config errors.
@@ -1680,6 +1746,7 @@ impl Server {
         &self,
         name: &str,
         designator: &Designator,
+        report: &Reporter,
     ) -> Result<Option<Rc<dyn Channel>>> {
         let target = &designator.service;
         let context = &designator.error_context;
@@ -1698,6 +1765,10 @@ impl Server {
                      entrypoint, and the service does not have a default entrypoint."
                 ),
             },
+            Some(Service::Lazy(target_lazy)) => {
+                // The template its props specialize, resolved once the worker is built.
+                return Ok(Some(target_lazy.entrypoint(entrypoint, None, false)));
+            }
             Some(_) => format!("{context} refers to service \"{target}\", but it is not a Worker."),
             None => {
                 format!(
@@ -1705,7 +1776,7 @@ impl Server {
                 )
             }
         };
-        self.report.reference_error(Some(name), target, error);
+        report.reference_error(Some(name), target, error);
         Ok(None)
     }
 
@@ -1713,8 +1784,13 @@ impl Server {
     /// could only fail, which would fail every request it tails: one whose service is missing
     /// (the lookup reported it) or already known to be broken. A worker found broken later is
     /// skipped when a request starts (`WorkerService::start_tail`).
-    fn tail(&self, name: &str, designator: &Designator) -> Option<Rc<dyn Channel>> {
-        let channel = lookup_service(&self.services.0, &self.report, Some(name), designator);
+    fn tail(
+        &self,
+        name: &str,
+        designator: &Designator,
+        report: &Reporter,
+    ) -> Option<Rc<dyn Channel>> {
+        let channel = lookup_service(&self.services.0, report, Some(name), designator);
         let target = &designator.service;
         (self.services.0.contains_key(target) && !self.report.is_broken(target)).then_some(channel)
     }
@@ -1841,6 +1917,32 @@ async fn make_service(
         }
         Ok(service::Which::Worker(worker)) => {
             let worker = worker.map_err(capnp_error)?;
+            // Under the inspector every isolate registers at start, so none is built later.
+            if factory.platform().is_lazy(name) && !ffi::factory_has_inspector(factory.raw()) {
+                if worker
+                    .get_durable_object_namespaces()
+                    .map_err(capnp_error)?
+                    .len()
+                    > 0
+                    || worker.has_workflows_engine()
+                {
+                    report.service_error(
+                        name,
+                        "Worker is lazy but defines Durable Object namespaces or Workflows, \
+                         which are wired before any request; a lazy Worker is built on its first \
+                         request.",
+                    );
+                    return Ok(Service::Leaf(Rc::new(InvalidConfigChannel)));
+                }
+                return Ok(Service::Lazy(LazyWorkerService::new(
+                    Rc::clone(factory),
+                    name,
+                    index,
+                    actor_configs,
+                    &overrides.environment,
+                    inbound_listeners,
+                )));
+            }
             WorkerService::new(
                 Rc::clone(factory),
                 name,
@@ -1891,7 +1993,20 @@ impl ServerHandle {
         persistent: bool,
     ) -> Result<Box<SubrequestChannel>> {
         let entrypoint: Option<&str> = entrypoint.into();
-        self.server()?
+        let server = self.server()?;
+        if let Some(lazy) = server
+            .services
+            .0
+            .get(service_name)
+            .and_then(Service::as_lazy)
+        {
+            return Ok(SubrequestChannel::new(lazy.entrypoint(
+                entrypoint,
+                Some(props),
+                persistent,
+            )));
+        }
+        server
             .stub_worker(service_name)?
             .entrypoint(entrypoint, Some(props), persistent)
             .map(SubrequestChannel::new)
@@ -1956,6 +2071,13 @@ impl ServerHandle {
         let props: Option<KjOwn<Frankenvalue>> = props.into();
         let server = self.server()?;
         let service = server.debug_service(service_name)?;
+        if let Some(lazy) = service.as_lazy() {
+            return Ok(SubrequestChannel::new(lazy.entrypoint(
+                entrypoint,
+                Some(props.unwrap_or_else(ffi::frankenvalue_new)),
+                false,
+            )));
+        }
         let Some(worker) = service.as_worker() else {
             if entrypoint.is_some() {
                 return Err(kj::failed!(

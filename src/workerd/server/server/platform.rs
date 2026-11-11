@@ -5,6 +5,7 @@
 //! workerd does.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use apsy_capnp::platform;
 use capnp::message::ReaderOptions;
@@ -37,6 +38,8 @@ pub struct ServiceSettings {
     pub limits: Option<Limits>,
     /// `Service.rebuildGroup`; none when unset or empty.
     pub rebuild_group: Option<String>,
+    /// Built on its first request (lazy.rs).
+    pub lazy: bool,
 }
 
 /// The settings, decoded.
@@ -48,6 +51,13 @@ pub struct Platform {
     services: HashMap<String, ServiceSettings>,
     /// `Platform.durableObjectMaxQueuedRequests`; none without settings or when it is 0.
     max_queued_requests: Option<u32>,
+    /// `Platform.isolateMemoryBudget`, `mallocSoftLimit` and `lazyWorkerEstimateBytes`.
+    isolate_memory_budget: u64,
+    malloc_soft_limit: u64,
+    lazy_worker_estimate_bytes: u64,
+    /// `Platform.lazyIdleMs` and `lazySweepMs`.
+    lazy_idle: Duration,
+    lazy_sweep: Duration,
 }
 
 impl Platform {
@@ -97,12 +107,14 @@ impl Platform {
                     .map_err(|e| kj::failed!("--platform-config: a rebuildGroup: {e}"))?,
             )
             .filter(|group| !group.is_empty());
+            let lazy = service.get_lazy();
             if services
                 .insert(
                     name.clone(),
                     ServiceSettings {
                         limits,
                         rebuild_group,
+                        lazy,
                     },
                 )
                 .is_some()
@@ -118,6 +130,11 @@ impl Platform {
             words,
             services,
             max_queued_requests,
+            isolate_memory_budget: root.get_isolate_memory_budget(),
+            malloc_soft_limit: root.get_malloc_soft_limit(),
+            lazy_worker_estimate_bytes: root.get_lazy_worker_estimate_bytes(),
+            lazy_idle: Duration::from_millis(root.get_lazy_idle_ms().into()),
+            lazy_sweep: Duration::from_millis(root.get_lazy_sweep_ms().into()),
         })
     }
 
@@ -145,6 +162,42 @@ impl Platform {
     #[must_use]
     pub fn max_queued_requests(&self) -> Option<u32> {
         self.max_queued_requests
+    }
+
+    /// Whether the Worker service `name` is built on its first request (lazy.rs).
+    #[must_use]
+    pub fn is_lazy(&self, name: &str) -> bool {
+        self.service(name).is_some_and(|service| service.lazy)
+    }
+
+    /// Bytes of resident memory past which idle lazy Workers are given up; 0 for never.
+    #[must_use]
+    pub fn isolate_memory_budget(&self) -> u64 {
+        self.isolate_memory_budget
+    }
+
+    /// Bytes the allocator holds itself to; 0 for the allocator's own behaviour.
+    #[must_use]
+    pub fn malloc_soft_limit(&self) -> u64 {
+        self.malloc_soft_limit
+    }
+
+    /// What giving up one idle lazy Worker is counted to free, in bytes.
+    #[must_use]
+    pub fn lazy_worker_estimate_bytes(&self) -> u64 {
+        self.lazy_worker_estimate_bytes
+    }
+
+    /// How recently a built lazy Worker must not have been asked for to be given up.
+    #[must_use]
+    pub fn lazy_idle(&self) -> Duration {
+        self.lazy_idle
+    }
+
+    /// How often idle lazy Workers are swept against the memory budget; never less than 1 ms.
+    #[must_use]
+    pub fn lazy_sweep(&self) -> Duration {
+        self.lazy_sweep.max(Duration::from_millis(1))
     }
 
     /// The bytes each Durable Object of the Worker service `name` may hold; 0 for no limit.

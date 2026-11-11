@@ -912,6 +912,81 @@ kj::String singleWorker(kj::StringPtr def) {
   ))"_kj);
 }
 
+// AppSynergy: a lazy Worker (apsy.capnp `Platform.Service.lazy`, server/lazy.rs). The Worker is
+// built on its first request, and a service binding from another Worker reaches it through the
+// stand-in.
+KJ_TEST("Server: a lazy Worker is built on its first request, through a socket or a binding") {
+  TestServer test(R"((
+    services = [
+      ( name = "lazy",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    return new Response("lazy " + new URL(request.url).pathname);
+              `  }
+              `}
+          )]
+        )
+      ),
+      ( name = "caller",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request, env) {
+              `    let response = await env.LAZY.fetch("http://x/via-binding");
+              `    return new Response("caller saw: " + await response.text());
+              `  }
+              `}
+          )],
+          bindings = [(name = "LAZY", service = "lazy")]
+        )
+      )
+    ],
+    sockets = [
+      (name = "lazy", address = "lazy-addr", service = "lazy"),
+      (name = "caller", address = "caller-addr", service = "caller")
+    ]
+  ))"_kj);
+  test.server.setPlatform(R"((services = [(name = "lazy", lazy = true)]))");
+
+  test.start();
+  test.connect("lazy-addr").httpGet200("/first", "lazy /first");
+  test.connect("caller-addr").httpGet200("/", "caller saw: lazy /via-binding");
+}
+
+KJ_TEST("Server: a lazy Worker may not define Durable Object namespaces") {
+  TestServer test(R"((
+    services = [
+      ( name = "lazy",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `import { DurableObject } from "cloudflare:workers";
+              `export class Counter extends DurableObject {}
+              `export default { async fetch() { return new Response("x"); } }
+          )],
+          durableObjectNamespaces = [(className = "Counter", uniqueKey = "counter")],
+          durableObjectStorage = (inMemory = void)
+        )
+      )
+    ]
+  ))"_kj);
+  test.server.setPlatform(R"((services = [(name = "lazy", lazy = true)]))");
+
+  test.expectErrors(R"(
+    service lazy: Worker is lazy but defines Durable Object namespaces or Workflows, which are wired before any request; a lazy Worker is built on its first request.
+  )"_blockquote);
+}
+
 // AppSynergy: "Date.now returns the time of the last I/O. It does not
 // advance during code execution", and performance.now() with it (factory WorkerTimerChannel).
 // Both read dateNow(): performance.now() directly, Date.now() through the V8 platform the binary

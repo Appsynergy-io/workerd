@@ -45,6 +45,13 @@ pub fn enter(config: &Config, options: &mut RunOptions) -> Result<(), String> {
     // the parent's, and any a library left open. After the pivot each is pointed at the empty
     // root in place, so none of them is a way back to the host.
     let host_fds = host_descriptors()?;
+    // Opened after the host's descriptors are listed, so it is not pointed at the empty root: the
+    // sweep of the workers built on demand reads the resident memory through it (server
+    // memory.rs).
+    options.process_status = Some(
+        std::fs::File::open("/proc/self/status")
+            .map_err(|e| format!("open /proc/self/status: {e}"))?,
+    );
     enter_namespaces(&disks, &sockets)?;
     let new_root = open_dir(Path::new("/"), libc::O_RDONLY)?;
     for fd in host_fds {

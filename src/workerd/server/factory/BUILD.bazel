@@ -40,6 +40,7 @@ wd_cc_library(
     deps = [
         ":apsy-commit-sync",
         ":apsy-limits",
+        ":apsy-memory",
         ":apsy-storage-cap",
         ":worker-factory-hdrs",
         "//src/rust/worker:bridge",
@@ -84,6 +85,23 @@ wd_cc_library(
 kj_test(
     src = "apsy-limits-test.c++",
     deps = [":apsy-limits"],
+)
+
+wd_cc_library(
+    name = "apsy-memory",
+    srcs = ["apsy-memory.c++"],
+    hdrs = ["apsy-memory.h"],
+    defines = select({
+        "//src/workerd/server:really_use_tcmalloc": ["WD_USE_TCMALLOC=1"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/workerd/jsg",
+        "@capnp-cpp//src/kj",
+    ] + select({
+        "//src/workerd/server:really_use_tcmalloc": ["@tcmalloc//tcmalloc:malloc_extension"],
+        "//conditions:default": [],
+    }),
 )
 
 wd_cc_library(

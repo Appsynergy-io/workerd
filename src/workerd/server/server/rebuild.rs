@@ -174,6 +174,15 @@ impl Rebuild {
         Some(build)
     }
 
+    /// Whether a build is running now.
+    pub fn in_progress(&self) -> bool {
+        self.state
+            .borrow()
+            .building
+            .as_ref()
+            .is_some_and(|building| building.peek().is_none())
+    }
+
     /// The last build's failure, while the worker it would have replaced is still condemned.
     pub fn failure(&self, worker: &ffi::CompiledWorker) -> Option<crate::Error> {
         let state = self.state.borrow();

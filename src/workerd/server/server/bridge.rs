@@ -333,6 +333,14 @@ pub mod ffi {
         /// `--platform-config`) as an encoded message in words; empty for none. Before any worker
         /// is compiled: a Worker's limits are read when it is.
         fn factory_set_platform(factory: &WorkerFactory, platform: &[u64]) -> Result<()>;
+        /// Whether the inspector is on, under which every isolate registers at start, so no
+        /// worker is built on demand (apsy.capnp `Platform.Service.lazy`, lazy.rs).
+        fn factory_has_inspector(factory: &WorkerFactory) -> bool;
+        /// AppSynergy: holds the allocator to `bytes` (apsy.capnp `Platform.mallocSoftLimit`,
+        /// factory/apsy-memory.h); 0 leaves it as it is.
+        fn factory_apply_malloc_soft_limit(bytes: u64);
+        /// AppSynergy: returns up to `bytes` of free memory the allocator keeps to the system now.
+        fn factory_release_memory_to_system(bytes: usize);
         /// Registers the server as the resolver of channel tokens and debug-port requests.
         /// Tokens cannot be decoded before this.
         fn factory_set_server(factory: &WorkerFactory, server: Box<ServerHandle>);
@@ -378,6 +386,9 @@ pub mod ffi {
         /// channels; and drops a dynamic worker's env channel tables and tails, which may refer
         /// back to the worker that loaded it. Called when the server unlinks the worker.
         fn worker_unlink(worker: &CompiledWorker);
+        /// Whether the worker runs background work past a response (a `waitUntil()`, a tail
+        /// worker's event): a lazy worker with some is not idle (lazy.rs).
+        fn worker_has_background_work(worker: &CompiledWorker) -> bool;
         /// Whether the worker's isolate is condemned: it has held more than its memory limit, and
         /// the next request belongs in a new isolate (factory/apsy-limit-enforcers.h).
         fn worker_condemned(worker: &CompiledWorker) -> bool;
