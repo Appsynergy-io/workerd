@@ -8,6 +8,7 @@
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/io-context.h>
 #include <workerd/server/actor-id-impl.h>
+#include <workerd/server/factory/apsy-commit-sync.h>
 #include <workerd/server/factory/apsy-storage-cap.h>
 #include <workerd/server/workerd-api.h>
 
@@ -641,19 +642,29 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     // reset too (see apsy-storage-cap.h).
     db->run("PRAGMA journal_mode=WAL;");
     apsy::capDatabaseSize(*db, maxBytes);
+    // AppSynergy: a commit returns without syncing, and the output gate waits for the sync
+    // instead, which runs off this thread and covers every commit made meanwhile (see
+    // apsy-commit-sync.h).
+    apsy::deferCommitSync(*db);
+    auto commitSync = kj::heap<apsy::CommitSync>(*KJ_ASSERT_NONNULL(storage->directory),
+        storage->getSqlitePath(rootKey, selfId, "-wal"_kj).toString());
     db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId, maxBytes](
                        SqliteDatabase& db) mutable {
       storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
       db.run("PRAGMA journal_mode=WAL;");
       apsy::capDatabaseSize(db, maxBytes);
+      apsy::deferCommitSync(db);
       storage->deleteDescendantStorage(*KJ_ASSERT_NONNULL(storage->directory), rootKey, selfId);
     });
-    kj::Function<kj::Promise<void>(SpanParent)> commit = [](SpanParent) -> kj::Promise<void> {
-      return kj::READY_NOW;
+    auto& sync = *commitSync;
+    kj::Function<kj::Promise<void>(SpanParent)> commit = [&sync](SpanParent) -> kj::Promise<void> {
+      return sync.sync();
     };
     KJ_IF_SOME(c, committer) {
-      commit = [c = kj::mv(c)](
-                   SpanParent) -> kj::Promise<void> { return result_task_run(c->commit()); };
+      // A replicated commit is durable here once synced, and in the cluster once committed.
+      commit = [&sync, c = kj::mv(c)](SpanParent) -> kj::Promise<void> {
+        return kj::joinPromises(kj::arr(sync.sync(), result_task_run(c->commit())));
+      };
       committer = kj::none;
     }
     auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
@@ -666,7 +677,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
         }
       }
     }
-    return sqlite.attach(kj::mv(sqliteHooks));
+    return sqlite.attach(kj::mv(sqliteHooks), kj::mv(commitSync));
   };
 }
 
@@ -892,6 +903,102 @@ kj::Promise<FacetStartInfo> facet_start_resolve(kj::Own<FacetStart> start) {
     .actor_class = KJ_REQUIRE_NONNULL(ActorClassChannelHandle::tryUnwrap(*info.actorClass),
         "a facet's class must be one the server made"),
   };
+}
+
+// =======================================================================================
+// Queued requests (AppSynergy)
+
+namespace {
+
+// One request a stub started at an object, holding its place in the object's queue (actor.rs
+// `ActorContainer::admit`) until the object begins its response (send() or acceptWebSocket()) or,
+// for any other event, until the event ends. A WebSocket or a streamed body the object answered
+// with is not waiting on the object, so it holds no place. The place is released by dropping it.
+class QueuedRequest final: public WorkerInterface {
+ public:
+  QueuedRequest(kj::Own<WorkerInterface> inner, ::rust::Box<QueuedPlace> place)
+      : inner(kj::mv(inner)),
+        place(kj::mv(place)) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      kj::HttpService::Response& response) override {
+    KJ_DEFER(release());
+    Responding responding(*this, response);
+    co_await inner->request(method, url, headers, requestBody, responding);
+  }
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    KJ_DEFER(release());
+    co_await inner->connect(host, headers, connection, response, settings);
+  }
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    KJ_DEFER(release());
+    co_await inner->prewarm(url);
+  }
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    KJ_DEFER(release());
+    co_return co_await inner->runScheduled(scheduledTime, cron);
+  }
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    KJ_DEFER(release());
+    co_return co_await inner->runAlarm(scheduledTime, retryCount);
+  }
+  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date scheduledTime) override {
+    KJ_DEFER(release());
+    co_return co_await inner->abandonAlarm(scheduledTime);
+  }
+  kj::Promise<bool> test() override {
+    KJ_DEFER(release());
+    co_return co_await inner->test();
+  }
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    KJ_DEFER(release());
+    co_return co_await inner->customEvent(kj::mv(event));
+  }
+
+ private:
+  kj::Own<WorkerInterface> inner;
+  kj::Maybe<::rust::Box<QueuedPlace>> place;
+
+  void release() {
+    place = kj::none;
+  }
+
+  // The caller's response, releasing the request's place when the object begins it.
+  class Responding final: public kj::HttpService::Response {
+   public:
+    Responding(QueuedRequest& request, kj::HttpService::Response& inner)
+        : request(request),
+          inner(inner) {}
+    kj::Own<kj::AsyncOutputStream> send(uint statusCode,
+        kj::StringPtr statusText,
+        const kj::HttpHeaders& headers,
+        kj::Maybe<uint64_t> expectedBodySize) override {
+      request.release();
+      return inner.send(statusCode, statusText, headers, expectedBodySize);
+    }
+    kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+      request.release();
+      return inner.acceptWebSocket(headers);
+    }
+
+   private:
+    QueuedRequest& request;
+    kj::HttpService::Response& inner;
+  };
+};
+
+}  // namespace
+
+kj::Own<WorkerInterface> new_queued_request(
+    kj::Own<WorkerInterface> inner, ::rust::Box<QueuedPlace> place) {
+  return kj::heap<QueuedRequest>(kj::mv(inner), kj::mv(place));
 }
 
 // =======================================================================================

@@ -16,6 +16,7 @@
 )]
 
 pub use crate::actor::MovedHook;
+pub use crate::actor::QueuedPlace;
 pub use crate::channels::AbortReason;
 pub use crate::channels::ActorClassChannel;
 pub use crate::channels::ActorHooks;
@@ -508,6 +509,12 @@ pub mod ffi {
         /// and held until the storage is gone or the process exits, and the first time it does it
         /// builds the alarm scheduler from `metadata.sqlite`. Always for in-memory storage.
         fn actor_storage_try_serve(storage: &ActorStorage) -> Result<bool>;
+        /// AppSynergy: `inner`, holding `place` in its object's queue until the object begins its
+        /// response or, for any other event, until the event ends; then `place` is dropped.
+        fn new_queued_request(
+            inner: KjOwn<WorkerInterface>,
+            place: Box<QueuedPlace>,
+        ) -> KjOwn<WorkerInterface>;
         /// Deletes every actor's storage and every alarm. Callers abort the actors first.
         fn actor_storage_delete_all(storage: &ActorStorage) -> Result<()>;
         /// Schedules the alarm of root actor `actor` (its id's hex), whose `idFromName()` name
@@ -970,6 +977,9 @@ pub mod ffi {
         fn actor_class_channel_clone(self: &ActorClassChannel) -> Box<ActorClassChannel>;
         fn require_allows_transfer(self: &ActorClassChannel) -> Result<()>;
         fn token(self: &ActorClassChannel, usage: TokenUsage) -> Result<KjOwn<PendingToken>>;
+
+        /// AppSynergy: one request's place in its object's queue, released when dropped.
+        type QueuedPlace;
 
         /// A Durable Object namespace, for its alarm scheduler.
         type ActorNamespaceHandle;

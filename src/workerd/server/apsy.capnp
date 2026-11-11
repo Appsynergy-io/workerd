@@ -31,6 +31,17 @@ struct Platform {
   # The most an isolate banks from invocations that ended under their CPU limit, in
   # milliseconds, and never more than one invocation's limit. The platform's own, as above.
 
+  durableObjectMaxQueuedRequests @3 :UInt32 = 1000;
+  # The requests stubs may have unanswered at one Durable Object before the next is refused with
+  # "Durable Object is overloaded. Too many requests queued.", an exception with `.overloaded`
+  # set: "A Durable Object that receives too many requests will, after attempting to queue them,
+  # return an overloaded error to the caller"
+  # [https://developers.cloudflare.com/durable-objects/platform/limits/]. Cloudflare publishes no
+  # queue length, so 1,000 is the platform's own: "An individual Object has a soft limit of 1,000
+  # requests per second" (same page), and a queue of 1,000 is about a second of that rate. An
+  # object's own alarms and hibernated WebSocket events are not counted. 0: no limit. Without
+  # settings the queue is unbounded, as upstream's.
+
   struct Service {
     name @0 :Text;
     # The service's name in the config.

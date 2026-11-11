@@ -71,8 +71,18 @@ fn a_service_named_twice_is_refused() {
 }
 
 #[test]
-fn without_settings_nothing_is_named() {
+fn without_settings_nothing_is_named_and_nothing_is_limited() {
     let platform = Platform::none();
     assert!(platform.words().is_empty());
     assert!(platform.service("main").is_none());
+    assert_eq!(platform.max_queued_requests(), None);
+}
+
+#[test]
+fn a_durable_objects_queue_is_1000_requests_unless_the_settings_say_otherwise() {
+    let default = Platform::decode(encoded(|_| {})).unwrap();
+    assert_eq!(default.max_queued_requests(), Some(1000));
+    let unbounded =
+        Platform::decode(encoded(|mut p| p.set_durable_object_max_queued_requests(0))).unwrap();
+    assert_eq!(unbounded.max_queued_requests(), None);
 }

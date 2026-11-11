@@ -5,6 +5,7 @@
 #include <workerd/jsg/jsg-test.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/server/apsy.capnp.h>
+#include <workerd/server/factory/apsy-commit-sync.h>
 #include <workerd/server/factory/worker-factory.h>
 #include <workerd/server/server/bridge.rs.h>
 #include <workerd/util/autogate.h>
@@ -110,6 +111,27 @@ kj::String operator""_blockquote(const char* str, size_t n) {
   return kj::String(result.releaseAsArray());
 }
 
+// AppSynergy: a reply that follows a Durable Object's write waits on that commit's sync, which
+// completes on another thread (apsy::CommitSync, the commit-sync change in this series), so a poll
+// of the loop can find nothing yet. While a sync is in flight the loop is polled again, in real
+// time, as receiveUdp() waits for the kernel: ten seconds at most, which only a failing test waits
+// out.
+template <typename T>
+bool pollSettled(kj::Promise<T>& promise, kj::WaitScope& ws) {
+  auto deadline = kj::systemPreciseMonotonicClock().now() + 10 * kj::SECONDS;
+  for (;;) {
+    if (promise.poll(ws)) return true;
+    if (apsy::CommitSync::inFlight() == 0) {
+      // A sync that ended since the poll has queued its result; one more poll delivers it, and
+      // may begin another sync.
+      if (promise.poll(ws)) return true;
+      if (apsy::CommitSync::inFlight() == 0) return false;
+    }
+    if (kj::systemPreciseMonotonicClock().now() > deadline) return false;
+    usleep(1000);
+  }
+}
+
 class TestStream {
  public:
   TestStream(kj::WaitScope& ws, kj::Own<kj::AsyncIoStream> stream)
@@ -188,7 +210,7 @@ class TestStream {
 
     char c;
     auto promise = stream->tryRead(&c, 1, 1);
-    if (!promise.poll(ws)) {
+    if (!pollSettled(promise, ws)) {
       // Read didn't complete immediately. We have no data available, but we're not at EOF.
       return false;
     }
@@ -250,7 +272,7 @@ class TestStream {
       buffer.resize(kj::max(buffer.size() + 256, buffer.capacity()));
 
       auto promise = stream->tryRead(buffer.begin() + pos, 1, buffer.size() - pos);
-      if (!promise.poll(ws)) {
+      if (!pollSettled(promise, ws)) {
         // A tryRead() of 1 byte didn't resolve, there must be no data to read.
         buffer.resize(pos);
         break;
@@ -325,7 +347,7 @@ class TestStream {
     buffer.resize(buffer.size() + bytesToRead);
     while (bytesRead < bytesToRead) {
       auto promise = stream->tryRead(buffer.begin() + pos, 1, buffer.size() - pos);
-      KJ_REQUIRE(promise.poll(ws), kj::str("No data available while ", what));
+      KJ_REQUIRE(pollSettled(promise, ws), kj::str("No data available while ", what));
       // A tryRead() of 1 byte didn't resolve, there must be no data to read.
 
       size_t n = promise.wait(ws);
@@ -675,7 +697,8 @@ class TestServer final: private kj::EntropySource {
     auto conn = connect(addr);
     conn.sendHttpGet("/");
     char c;
-    return !conn.getStream().tryRead(&c, 1, 1).poll(ws);
+    auto read = conn.getStream().tryRead(&c, 1, 1);
+    return !pollSettled(read, ws);
   }
 
   // Expect an incoming connection on the given address and from a network with the given
@@ -686,7 +709,7 @@ class TestServer final: private kj::EntropySource {
       kj::ArrayPtr<const kj::StringPtr> deniedPeers = nullptr,
       kj::SourceLocation loc = {}) {
     auto promise = server.accept(addr);
-    KJ_ASSERT_AT(promise.poll(ws), loc, "never received expected subrequest", addr);
+    KJ_ASSERT_AT(pollSettled(promise, ws), loc, "never received expected subrequest", addr);
 
     return TestStream(ws, promise.wait(ws));
   }
@@ -699,6 +722,14 @@ class TestServer final: private kj::EntropySource {
   void wait(size_t seconds) {
     auto delayPromise = timer.afterDelay(seconds * kj::SECONDS).eagerlyEvaluate(nullptr);
     while (!delayPromise.poll(ws)) {
+      // AppSynergy: a Durable Object commit's sync completes on another thread
+      // (apsy::CommitSync); it is real I/O the virtual clock must not run past, so it finishes
+      // before time moves on.
+      while (apsy::CommitSync::inFlight() > 0) {
+        usleep(1000);
+        ws.poll();
+      }
+      if (delayPromise.poll(ws)) break;
       // Since this test has no external I/O at all other than time, we know no events could
       // possibly occur until the next timer event. So just advance directly to it and continue.
       timer.advanceTo(KJ_ASSERT_NONNULL(timer.nextEvent()));

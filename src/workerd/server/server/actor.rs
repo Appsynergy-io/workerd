@@ -80,6 +80,11 @@ use crate::tasks::TaskHandle;
 const IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(10);
 /// How long a container with no clients stays in its namespace after its last access.
 const CONTAINER_EXPIRATION: Duration = Duration::from_secs(70);
+/// AppSynergy: the error Cloudflare refuses a request past an object's queue with
+/// (`ActorContainer::admit`, apsy.capnp `Platform.durableObjectMaxQueuedRequests`): the caller's
+/// stub throws it with `.overloaded` set.
+const OVERLOADED_MESSAGE: &str =
+    "jsg.Error: Durable Object is overloaded. Too many requests queued.";
 /// How often a namespace another process serves asks for its `serving.lock` again.
 const SERVING_LOCK_POLL: Duration = Duration::from_millis(50);
 /// How long a test eviction waits for the actor's requests to drain.
@@ -1132,6 +1137,19 @@ pub struct ActorContainer {
     /// What made a clustered root's requests in flight through its stubs, which the requests its
     /// work makes carry on (`Cause`).
     causes: RefCell<Causes>,
+    /// AppSynergy: the requests stubs started here that the object has not begun answering
+    /// (`admit`).
+    queued: Cell<u32>,
+}
+
+/// AppSynergy: one request's place in its object's queue (`ActorContainer::admit`), held by the
+/// factory's wrapper of the request until the object begins its response or the event ends.
+pub struct QueuedPlace(Rc<ActorContainer>);
+
+impl Drop for QueuedPlace {
+    fn drop(&mut self) {
+        self.0.queued.set(self.0.queued.get().saturating_sub(1));
+    }
 }
 
 impl ActorContainer {
@@ -1199,6 +1217,7 @@ impl ActorContainer {
             handoff: RefCell::new(None),
             heat: Cell::new(Heat::default()),
             causes: RefCell::new(Causes::default()),
+            queued: Cell::new(0),
         }
     }
 }
@@ -1326,6 +1345,32 @@ impl ActorContainer {
                 .borrow()
                 .values()
                 .any(|facet| facet.has_clients())
+    }
+
+    /// AppSynergy: the platform's queue length for an object (apsy.capnp
+    /// `Platform.durableObjectMaxQueuedRequests`); none without one, when requests queue without a
+    /// bound, as upstream's.
+    fn max_queued_requests(&self) -> Option<u32> {
+        self.namespace()
+            .ok()
+            .and_then(|ns| ns.factory.platform().max_queued_requests())
+    }
+
+    /// AppSynergy: a place in this object's queue for a request a stub starts here, while fewer
+    /// than `limit` it admitted are unanswered; none past that, when the request is refused
+    /// overloaded: "A Durable Object that receives too many requests will, after attempting to
+    /// queue them, return an overloaded error to the caller"
+    /// [https://developers.cloudflare.com/durable-objects/platform/limits/]. Upstream queues
+    /// without a bound, so an object offered more than it serves answers every request later and
+    /// later. The object's own alarms and hibernated WebSocket events do not come through a stub
+    /// and are not counted.
+    fn admit(self: &Rc<Self>, limit: u32) -> Option<QueuedPlace> {
+        let queued = self.queued.get();
+        if queued >= limit {
+            return None;
+        }
+        self.queued.set(queued + 1);
+        Some(QueuedPlace(Rc::clone(self)))
     }
 
     /// Whether a running actor exists.
@@ -2375,7 +2420,19 @@ impl Channel for ActorChannel {
         mut metadata: KjOwn<RequestMetadata>,
     ) -> Result<KjOwn<WorkerInterface>> {
         ffi::request_metadata_set_from_persistent_stub(metadata.as_mut(), self.persistent);
-        self.container.start_request(metadata)
+        // AppSynergy: past the object's queue the request is refused, never queued; without the
+        // platform's queue length it is queued as upstream queues it.
+        let Some(limit) = self.container.max_queued_requests() else {
+            return self.container.start_request(metadata);
+        };
+        let Some(place) = self.container.admit(limit) else {
+            return Ok(PromisedInterface::new(async {
+                Err(kj::overloaded!("{OVERLOADED_MESSAGE}"))
+            })
+            .into_kj());
+        };
+        let request = self.container.start_request(metadata)?;
+        Ok(ffi::new_queued_request(request, Box::new(place)))
     }
 
     fn require_allows_transfer(&self) -> Result<()> {

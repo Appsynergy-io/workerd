@@ -421,6 +421,7 @@ kj_test(
     deps = [
         ":apsy_capnp",
         "//src/rust/cxx/kj-rs-io:kj-rs-io-lib",
+        "//src/workerd/server/factory:apsy-commit-sync",
         "//src/workerd/server/factory:worker-factory",
         "//src/workerd/server/server:workerd-server",
         "//src/workerd/util:test-util",

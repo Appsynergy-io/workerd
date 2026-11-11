@@ -56,6 +56,7 @@ struct SpawnedTask;
 struct ActorClassChannel;
 struct ActorNamespaceHandle;
 struct ActorHooks;
+struct QueuedPlace;
 struct Committer;
 struct ResultTask;
 struct AbortReason;
@@ -305,6 +306,8 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     ::rust::Str uniqueKey,
     ::rust::Box<ActorNamespaceHandle> actors);
 bool actor_storage_try_serve(const ActorStorage& storage);
+kj::Own<WorkerInterface> new_queued_request(
+    kj::Own<WorkerInterface> inner, ::rust::Box<QueuedPlace> place);
 void actor_storage_set_alarm(
     const ActorStorage& storage, ::rust::Str actor, ::rust::Str name, uint64_t atMs);
 kj::Own<WorkerInterface> alarm_owned_elsewhere(AlarmElsewhere then);

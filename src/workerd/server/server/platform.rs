@@ -46,6 +46,8 @@ pub struct Platform {
     /// for [`Platform::none`].
     words: Vec<u64>,
     services: HashMap<String, ServiceSettings>,
+    /// `Platform.durableObjectMaxQueuedRequests`; none without settings or when it is 0.
+    max_queued_requests: Option<u32>,
 }
 
 impl Platform {
@@ -110,7 +112,13 @@ impl Platform {
                 ));
             }
         }
-        Ok(Self { words, services })
+        let max_queued_requests =
+            Some(root.get_durable_object_max_queued_requests()).filter(|&limit| limit > 0);
+        Ok(Self {
+            words,
+            services,
+            max_queued_requests,
+        })
     }
 
     /// The encoded message; empty when the process was started without settings.
@@ -130,6 +138,13 @@ impl Platform {
     #[must_use]
     pub fn rebuild_group(&self, name: &str) -> Option<&str> {
         self.service(name)?.rebuild_group.as_deref()
+    }
+
+    /// The requests stubs may have unanswered at one Durable Object before the next is refused
+    /// overloaded; none for no limit, as upstream.
+    #[must_use]
+    pub fn max_queued_requests(&self) -> Option<u32> {
+        self.max_queued_requests
     }
 
     /// The bytes each Durable Object of the Worker service `name` may hold; 0 for no limit.

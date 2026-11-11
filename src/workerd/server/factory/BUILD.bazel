@@ -38,6 +38,7 @@ wd_cc_library(
     ],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
+        ":apsy-commit-sync",
         ":apsy-limits",
         ":apsy-storage-cap",
         ":worker-factory-hdrs",
@@ -83,6 +84,18 @@ wd_cc_library(
 kj_test(
     src = "apsy-limits-test.c++",
     deps = [":apsy-limits"],
+)
+
+wd_cc_library(
+    name = "apsy-commit-sync",
+    srcs = ["apsy-commit-sync.c++"],
+    hdrs = ["apsy-commit-sync.h"],
+    deps = ["//src/workerd/util:sqlite"],
+)
+
+kj_test(
+    src = "apsy-commit-sync-test.c++",
+    deps = [":apsy-commit-sync"],
 )
 
 wd_cc_library(
