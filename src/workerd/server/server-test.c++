@@ -5980,6 +5980,82 @@ KJ_TEST("Server: external server inject headers") {
     OK)"_blockquote);
 }
 
+KJ_TEST("Server: external server injects request headers into a connect()") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2022-08-17",
+          compatibilityFlags = ["nodejs_compat"],
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `import { connect } from 'cloudflare:sockets';
+                `import assert from 'node:assert';
+                `
+                `export default {
+                `  async fetch(request, env) {
+                `    let sock = connect("subhost:123");
+                `
+                `    let writer = sock.writable.getWriter();
+                `    await writer.write(new TextEncoder().encode("hello"));
+                `    await writer.close();
+                `
+                `    let reader = sock.readable.getReader();
+                `    let chunk = await reader.read();
+                `    assert.strictEqual(chunk.done, false);
+                `    assert.strictEqual(new TextDecoder().decode(chunk.value), "goodbye");
+                `
+                `    await sock.close();
+                `    return new Response("OK");
+                `  }
+                `}
+            )
+          ],
+          globalOutbound = "egress"
+        )
+      ),
+      ( name = "egress",
+        external = (
+          address = "ext-addr",
+          http = (
+            style = proxy,
+            injectRequestHeaders = [
+              (name = "Apsy-Account", value = "a1"),
+            ]
+          )
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "hello")
+    ]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+
+  {
+    auto subreq = test.receiveSubrequest("ext-addr");
+    // The client sends the tunnel's bytes once the proxy has answered the CONNECT (hyper's
+    // upgrade), so the Worker's write arrives after the 200.
+    subreq.recv(R"(
+      CONNECT subhost:123 HTTP/1.1
+      Apsy-Account: a1
+
+    )"_blockquote);
+    subreq.send(R"(
+      HTTP/1.1 200 OK
+
+    )"_blockquote);
+    subreq.recv("hello");
+    subreq.send("goodbye");
+  }
+
+  conn.recvHttp200("OK");
+}
+
 KJ_TEST("Server: external server cf blob header") {
   TestServer test(R"((
     services = [

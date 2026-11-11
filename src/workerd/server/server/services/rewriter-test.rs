@@ -104,3 +104,41 @@ fn a_header_the_table_lacks_is_refused() {
             .is_err()
     );
 }
+
+#[test]
+fn a_connect_carries_the_injected_request_headers() {
+    let table = HeaderTable::builtin();
+    let rewriter = options(|mut o| {
+        o.set_style(http_options::Style::Proxy);
+        let mut inject = o.init_inject_request_headers(1).get(0);
+        inject.set_name("Content-Type");
+        inject.set_value("account-token");
+    });
+    let mut headers = Headers::new(&table);
+    headers.set(HeaderId::HOST, "example.com:443");
+    let edited = rewriter
+        .rewrite_outgoing_connect(&table, headers.as_ref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        header(&edited, HeaderId::CONTENT_TYPE).as_deref(),
+        Some(&b"account-token"[..])
+    );
+    assert_eq!(
+        header(&edited, HeaderId::HOST).as_deref(),
+        Some(&b"example.com:443"[..])
+    );
+}
+
+#[test]
+fn a_connect_with_nothing_to_inject_is_sent_as_it_came() {
+    let table = HeaderTable::builtin();
+    let rewriter = options(|mut o| o.set_style(http_options::Style::Host));
+    let headers = Headers::new(&table);
+    assert!(
+        rewriter
+            .rewrite_outgoing_connect(&table, headers.as_ref())
+            .unwrap()
+            .is_none()
+    );
+}

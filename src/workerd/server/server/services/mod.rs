@@ -328,10 +328,13 @@ impl Service for ExternalHttpRequest {
         response: ConnectResponse<'a>,
         settings: ConnectSettings<'a>,
     ) -> Result<()> {
-        let mut client = self
+        let table = header_table(&self.service.factory);
+        let injected = self
             .service
-            .pool
-            .client(header_table(&self.service.factory));
+            .rewriter
+            .rewrite_outgoing_connect(table, headers)?;
+        let headers = injected.as_deref().map_or(headers, HeadersRef::from);
+        let mut client = self.service.pool.client(table);
         let mut tls_starter = settings.tls_starter.into();
         let settings = reborrow_settings(settings.use_tls, &mut tls_starter);
         client

@@ -180,6 +180,17 @@ impl HttpRewriter {
         Ok(Rewritten { url, headers })
     }
 
+    /// Rewrites a CONNECT leaving for an external server: it carries `injectRequestHeaders` as
+    /// every other request does, so the service it reaches can tell who opened the tunnel by what
+    /// the config injected. None when nothing is injected.
+    pub fn rewrite_outgoing_connect(
+        &self,
+        table: &HeaderTable,
+        headers: HeadersRef<'_>,
+    ) -> Result<Option<KjOwn<ffi::HttpHeaders>>> {
+        self.edited(table, headers, &[])
+    }
+
     /// Rewrites a request arriving on a socket. `url` is what the client sent; `physical_protocol`
     /// is the socket's ("http" or "https"). Returns the request to give the worker and the cf
     /// blob it carried, if the options name a header for it; none for a request the options can
