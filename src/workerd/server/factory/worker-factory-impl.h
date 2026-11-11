@@ -240,7 +240,8 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
   void taskFailed(kj::Exception&& exception) override;
 };
 
-// The storage of a namespace: its directory (none in memory), the VFS, and the alarm scheduler.
+// The storage of a namespace: its directory (none in memory), the VFS, and the alarm scheduler,
+// built once this process serves the namespace (`tryServe()`).
 class ActorStorage::Impl final: public kj::Refcounted {
  public:
   Impl(const WorkerFactory& factory,
@@ -257,7 +258,24 @@ class ActorStorage::Impl final: public kj::Refcounted {
   kj::Own<const kj::Directory> sqliteDirectory;
   SqliteDatabase::Vfs vfs;
   kj::String uniqueKey;
-  kj::Own<AlarmScheduler> alarmScheduler;
+  // None until `tryServe()` finds this process serves the namespace; `getActor` is what it is
+  // built with.
+  kj::Maybe<kj::Own<AlarmScheduler>> alarmScheduler;
+  kj::Maybe<AlarmScheduler::GetActorFn> getActor;
+  // AppSynergy: `serving.lock` in the namespace's directory, open once `tryServe()` has run; the
+  // process holding an exclusive flock on it serves the namespace's objects, until this storage
+  // is gone or the process exits.
+  kj::Maybe<kj::Own<const kj::File>> servingLock;
+  // The duplicate of servingLock's descriptor the kernel closes last (worker-factory-actor.c++
+  // holdServingLockUntilExit()), closed with this storage.
+  kj::Maybe<kj::AutoCloseFd> servingLockHeld;
+  kj::Timer& timer;
+
+  // AppSynergy: whether this process now serves the namespace, taking `serving.lock` without
+  // waiting and, the first time it does, building the alarm scheduler from `metadata.sqlite` as
+  // it stands then. Always for in-memory storage, which no other process opens.
+  bool tryServe();
+  AlarmScheduler& getAlarmScheduler();
 
   // The facet index of the root actor `rootKey`, read from disk for one operation; none when it
   // does not exist (so no facet can have storage).

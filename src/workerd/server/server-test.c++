@@ -3806,8 +3806,10 @@ KJ_TEST("Server: Durable Objects (on disk)") {
     // The storage directory contains .sqlite, .sqlite-wal and .sqlite-shm files for both
     // objects, plus the per-namespace metadata.sqlite (alarm scheduler) and its WAL and SHM
     // files. (The `-shm` files exist because this is a real disk directory; SQLite leaves shared
-    // memory to the VFS, and the KJ-wrapping VFS over an in-memory directory kept none.)
-    KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 9);
+    // memory to the VFS, and the KJ-wrapping VFS over an in-memory directory kept none.) The
+    // namespace's serving.lock is the tenth (AppSynergy; actor.rs `ActorNamespace::link`).
+    KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 10);
+    KJ_EXPECT(dir->exists(kj::Path({"mykey", "serving.lock"})));
     KJ_EXPECT(dir->exists(kj::Path(
         {"mykey", "02b496f65dd35cbac90e3e72dc5a398ee93926ea4a3821e26677082d2e6f9b79.sqlite"})));
     KJ_EXPECT(dir->exists(kj::Path(
@@ -3820,8 +3822,8 @@ KJ_TEST("Server: Durable Objects (on disk)") {
     KJ_EXPECT(dir->exists(kj::Path({"mykey", "metadata.sqlite-wal"})));
   }
 
-  // Having torn everything down, the WAL files should be gone.
-  KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 3);
+  // Having torn everything down, the WAL files should be gone. serving.lock stays (AppSynergy).
+  KJ_EXPECT(dir->openSubdir(kj::Path({"mykey"}))->listNames().size() == 4);
   KJ_EXPECT(dir->exists(kj::Path(
       {"mykey", "02b496f65dd35cbac90e3e72dc5a398ee93926ea4a3821e26677082d2e6f9b79.sqlite"})));
   KJ_EXPECT(dir->exists(kj::Path(
@@ -8616,7 +8618,7 @@ KJ_TEST("Server: Durable Object facets") {
   for (auto& name: nsDir->listNames()) {
     KJ_EXPECT(
         name.startsWith("3652ef6221834806dc8df802d1d216e27b7d07e0a6b7adf6cfdaeec90f06459a.") ||
-            name.startsWith("metadata.sqlite"),
+            name.startsWith("metadata.sqlite") || name == "serving.lock",
         "unexpected file found in namespace storage", name);
   }
 

@@ -503,6 +503,11 @@ pub mod ffi {
             unique_key: &str,
             actors: Box<ActorNamespaceHandle>,
         ) -> Result<KjOwn<ActorStorage>>;
+        /// AppSynergy: whether this process now serves the namespace's objects: it holds an
+        /// exclusive flock on `serving.lock` in the namespace's directory, taken without waiting
+        /// and held until the storage is gone or the process exits, and the first time it does it
+        /// builds the alarm scheduler from `metadata.sqlite`. Always for in-memory storage.
+        fn actor_storage_try_serve(storage: &ActorStorage) -> Result<bool>;
         /// Deletes every actor's storage and every alarm. Callers abort the actors first.
         fn actor_storage_delete_all(storage: &ActorStorage) -> Result<()>;
         /// Schedules the alarm of root actor `actor` (its id's hex), whose `idFromName()` name

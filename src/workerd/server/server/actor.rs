@@ -80,6 +80,8 @@ use crate::tasks::TaskHandle;
 const IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(10);
 /// How long a container with no clients stays in its namespace after its last access.
 const CONTAINER_EXPIRATION: Duration = Duration::from_secs(70);
+/// How often a namespace another process serves asks for its `serving.lock` again.
+const SERVING_LOCK_POLL: Duration = Duration::from_millis(50);
 /// How long a test eviction waits for the actor's requests to drain.
 const EVICT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a test eviction waits before re-checking an actor that has no requests but is still
@@ -129,7 +131,13 @@ pub struct ActorNamespace {
     broken: Cell<bool>,
     /// Actors a stop left as they were at its deadline: they end as the process exits.
     left_behind: RefCell<Vec<Rc<ActorContainer>>>,
+    /// AppSynergy: the wait for this process to serve the namespace's objects, while another
+    /// process holds its `serving.lock` (`link`); none once it serves.
+    serving: RefCell<Option<Serving>>,
 }
+
+/// The wait for `serving.lock`, which every object start meanwhile waits on.
+type Serving = Shared<LocalBoxFuture<'static, Result<()>>>;
 
 /// The first resolution of an actor: its end, however it ends, wakes the requests that waited.
 struct Resolving<'a> {
@@ -175,6 +183,7 @@ impl ActorNamespace {
             resolving: RefCell::new(HashMap::new()),
             broken: Cell::new(false),
             left_behind: RefCell::new(Vec::new()),
+            serving: RefCell::new(None),
         })
     }
 
@@ -418,6 +427,22 @@ impl ActorNamespace {
 }
 
 /// Drops containers the namespace has not touched in `CONTAINER_EXPIRATION`, that often.
+/// Asks for `serving.lock` every [`SERVING_LOCK_POLL`] until the process holding it exits and
+/// this one serves the namespace (`ActorNamespace::link`).
+async fn await_serving(namespace: Weak<ActorNamespace>) -> Result<()> {
+    loop {
+        let Some(ns) = namespace.upgrade() else {
+            return Err(kj::disconnected!("the Durable Object namespace is gone"));
+        };
+        if ffi::actor_storage_try_serve(ns.storage()?)? {
+            return Ok(());
+        }
+        let factory = Rc::clone(&ns.factory);
+        drop(ns);
+        factory.sleep(SERVING_LOCK_POLL).await;
+    }
+}
+
 async fn cleanup_loop(namespace: Weak<ActorNamespace>) {
     loop {
         let Some(ns) = namespace.upgrade() else {
@@ -577,6 +602,15 @@ impl ActorNamespace {
 
     /// Opens the namespace's storage. `storage_path` is the directory of the worker's
     /// `durableObjectStorage.localDisk` service; none for in-memory storage.
+    ///
+    /// AppSynergy: one process serves a namespace's objects at a time. A deploy starts the
+    /// replacement workerd while the one it replaces drains, both over the same
+    /// directory; each would fire the alarms in `metadata.sqlite`, and each would run its own
+    /// instance of an object, where Cloudflare runs one instance and an alarm once per
+    /// `setAlarm`. The process holding `serving.lock` serves
+    /// (`actor_storage_try_serve`); another polls for it, its alarm scheduler unbuilt and its
+    /// objects waiting (`when_serving`), so a request during the drain waits for the previous
+    /// process to exit rather than being refused.
     pub fn link(&self, storage_path: Option<&str>) -> Result<()> {
         if self.is_linked() {
             return Err(kj::failed!("already called link()"));
@@ -608,6 +642,7 @@ impl ActorNamespace {
             unique_key,
             Box::new(ActorNamespaceHandle(Weak::clone(&self.this))),
         )?;
+        let serving = ffi::actor_storage_try_serve(&storage)?;
         if self.cluster().is_some() {
             // An earlier process's alarms: its objects may live elsewhere now, and peers adopt
             // its alarms from the bucket.
@@ -615,7 +650,26 @@ impl ActorNamespace {
         }
         // Checked above; nothing else sets it.
         let _ = self.storage.set(storage);
+        if !serving {
+            let wait = self
+                .factory
+                .spawn(await_serving(Weak::clone(&self.this)))
+                .boxed_local()
+                .shared();
+            *self.serving.borrow_mut() = Some(wait);
+        }
         Ok(())
+    }
+
+    /// What an object must wait on before it starts: the wait for `serving.lock`, while another
+    /// process serves the namespace (`link`). None once this one does.
+    fn when_serving(&self) -> Option<Serving> {
+        let mut serving = self.serving.borrow_mut();
+        if matches!(serving.as_ref()?.peek(), Some(Ok(()))) {
+            *serving = None;
+            return None;
+        }
+        serving.clone()
     }
 
     /// Whether this instance is handing off root actor `key`.
@@ -1323,6 +1377,11 @@ impl ActorContainer {
             let class = self.class()?;
             class.when_ready().await?;
             self.require_not_broken()?;
+            // No object runs until this process serves its namespace (`ActorNamespace::link`).
+            if let Some(serving) = self.namespace()?.when_serving() {
+                serving.await?;
+                self.require_not_broken()?;
+            }
             self.prepare_storage().await?;
             self.require_not_broken()?;
             if self.retirement.borrow().is_some() {

@@ -11,6 +11,12 @@
 #include <workerd/server/factory/apsy-storage-cap.h>
 #include <workerd/server/workerd-api.h>
 
+#if __linux__
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/resource.h>
+#endif
+
 namespace workerd::server {
 
 // =======================================================================================
@@ -177,17 +183,85 @@ ActorStorage::Impl::Impl(const WorkerFactory& factory,
               : vfsDirectory->clone()),
       vfs(*sqliteDirectory),
       uniqueKey(kj::mv(uniqueKey)),
-      alarmScheduler(kj::heap<AlarmScheduler>(kj::systemPreciseCalendarClock(),
-          factory.getImpl().timer,
-          vfs,
-          kj::Path({"metadata.sqlite"}),
-          [this](const ActorKey& actor) -> kj::Own<WorkerInterface> {
-            // The id carries the persisted name so that `ctx.id.name` is set when the alarm runs.
-            auto id = ActorIdFactoryImpl(this->uniqueKey)
-                          .idFromStringNamed(kj::str(actor.actorId),
-                              actor.name.map([](kj::StringPtr n) { return kj::str(n); }));
-            return actors->actor_for_alarm(kj::heap<ActorIdHandle>(kj::mv(id)));
-          })) {}
+      getActor([this](const ActorKey& actor) -> kj::Own<WorkerInterface> {
+        // The id carries the persisted name so that `ctx.id.name` is set when the alarm runs.
+        auto id = ActorIdFactoryImpl(this->uniqueKey)
+                      .idFromStringNamed(kj::str(actor.actorId),
+                          actor.name.map([](kj::StringPtr n) { return kj::str(n); }));
+        return actors->actor_for_alarm(kj::heap<ActorIdHandle>(kj::mv(id)));
+      }),
+      timer(factory.getImpl().timer) {}
+
+namespace {
+// Whether this process now holds an exclusive flock on `fd`, without waiting.
+bool tryExclusiveLock(int fd) {
+#if __linux__
+  for (;;) {
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return true;
+    if (errno == EINTR) continue;
+    if (errno == EWOULDBLOCK) return false;
+    KJ_FAIL_SYSCALL("flock(serving.lock)", errno);
+  }
+#else
+  // Only the Linux build runs a platform node; elsewhere the lock is not taken.
+  (void)fd;
+  return true;
+#endif
+}
+// Keeps the flock on `fd` in a duplicate numbered past every descriptor the process opens, so that
+// a dying process's kernel, which closes descriptors in ascending order, closes it last. The
+// lock's descriptor was opened before every database's: released first, it would let the next
+// process serve the namespace while this one still holds a database's lock, and that process's
+// first query would fail with SQLITE_BUSY. While the process lives, the duplicate is closed with
+// the namespace's storage, after every database (each holds the storage), so a server built again
+// in the same process takes the lock back. None when no such descriptor could be had.
+kj::Maybe<kj::AutoCloseFd> holdServingLockUntilExit(int fd) {
+#if __linux__
+  struct rlimit limit {};
+  int last = 1023;
+  if (::getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+    if (limit.rlim_cur == RLIM_INFINITY) {
+      // Any descriptor a process opens stays far below this one.
+      last = 1 << 16;
+    } else if (limit.rlim_cur > 1) {
+      last = static_cast<int>(kj::min<rlim_t>(limit.rlim_cur - 1, 1 << 20));
+    }
+  }
+  int held = ::fcntl(fd, F_DUPFD_CLOEXEC, last);
+  if (held < 0) {
+    KJ_LOG(WARNING, "could not move serving.lock to a descriptor closed last", errno);
+    return kj::none;
+  }
+  return kj::AutoCloseFd(held);
+#else
+  (void)fd;
+  return kj::none;
+#endif
+}
+}  // namespace
+
+bool ActorStorage::Impl::tryServe() {
+  if (alarmScheduler != kj::none) return true;
+  KJ_IF_SOME(dir, directory) {
+    if (servingLock == kj::none) {
+      servingLock =
+          dir->openFile(kj::Path({"serving.lock"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+    }
+    // A directory with no descriptor is one no other process opens, so this one serves it.
+    KJ_IF_SOME(fd, KJ_ASSERT_NONNULL(servingLock)->getFd()) {
+      if (!tryExclusiveLock(fd)) return false;
+      servingLockHeld = holdServingLockUntilExit(fd);
+    }
+  }
+  alarmScheduler = kj::heap<AlarmScheduler>(kj::systemPreciseCalendarClock(), timer, vfs,
+      kj::Path({"metadata.sqlite"}), KJ_ASSERT_NONNULL(kj::mv(getActor)));
+  getActor = kj::none;
+  return true;
+}
+
+AlarmScheduler& ActorStorage::Impl::getAlarmScheduler() {
+  return *KJ_REQUIRE_NONNULL(alarmScheduler, "an object ran before its process served it");
+}
 
 kj::Maybe<kj::Own<FacetTreeIndex>> ActorStorage::Impl::getFacetTreeIndexIfNotEmpty(
     const kj::Directory& dir, kj::StringPtr rootKey) {
@@ -282,11 +356,15 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
       factory, kj::mv(directory), kj::str(uniqueKey), kj::mv(actors)));
 }
 
+bool actor_storage_try_serve(const ActorStorage& storage) {
+  return storage.getImpl().tryServe();
+}
+
 void actor_storage_set_alarm(
     const ActorStorage& storage, ::rust::Str actor, ::rust::Str name, uint64_t atMs) {
   auto key = ActorKey(kj::str(actor), name.empty() ? kj::Maybe<kj::String>() : kj::str(name));
   auto time = kj::UNIX_EPOCH + atMs * kj::MILLISECONDS;
-  auto& scheduler = *storage.getImpl().alarmScheduler;
+  auto& scheduler = storage.getImpl().getAlarmScheduler();
   // Only ever earlier: waking an object early is a no-op, late is a missed alarm.
   KJ_IF_SOME(current, scheduler.getAlarm(key)) {
     if (current <= time) return;
@@ -342,7 +420,10 @@ kj::Own<WorkerInterface> alarm_owned_elsewhere(AlarmElsewhere then) {
 }
 
 void actor_storage_delete_all(const ActorStorage& storage) {
-  storage.getImpl().alarmScheduler->deleteAll();
+  // Before this process serves the namespace, its alarms are the serving process's.
+  KJ_IF_SOME(scheduler, storage.getImpl().alarmScheduler) {
+    scheduler->deleteAll();
+  }
 }
 
 void actor_storage_delete_facet(const ActorStorage& storage,
@@ -480,10 +561,10 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
       kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
     uint64_t atMs = 0;
     KJ_IF_SOME(scheduledTime, newAlarmTime) {
-      storage->alarmScheduler->setAlarm(actor, scheduledTime);
+      storage->getAlarmScheduler().setAlarm(actor, scheduledTime);
       atMs = (scheduledTime - kj::UNIX_EPOCH) / kj::MILLISECONDS;
     } else {
-      storage->alarmScheduler->deleteAlarm(actor);
+      storage->getAlarmScheduler().deleteAlarm(actor);
     }
     if (!storage->actors->replicated()) return kj::READY_NOW;
     // A new or earlier alarm is in the cluster's index before the commit setting it starts, so
@@ -498,7 +579,7 @@ class ActorSqliteHooks final: public ActorSqlite::Hooks {
   // The object came here with an alarm at `time`, which this instance has not scheduled. A failed
   // index write is written again by the index's next tidy.
   void opened(kj::Date time) {
-    storage->alarmScheduler->setAlarm(actor, time);
+    storage->getAlarmScheduler().setAlarm(actor, time);
     auto name = actor.name.map([](kj::String& n) { return n.asPtr(); }).orDefault(""_kj);
     auto atMs = (time - kj::UNIX_EPOCH) / kj::MILLISECONDS;
     result_task_run(storage->actors->alarm_opened(toRust(actor.actorId), toRust(name), atMs))

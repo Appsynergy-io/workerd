@@ -304,6 +304,7 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     ::rust::Str path,
     ::rust::Str uniqueKey,
     ::rust::Box<ActorNamespaceHandle> actors);
+bool actor_storage_try_serve(const ActorStorage& storage);
 void actor_storage_set_alarm(
     const ActorStorage& storage, ::rust::Str actor, ::rust::Str name, uint64_t atMs);
 kj::Own<WorkerInterface> alarm_owned_elsewhere(AlarmElsewhere then);
