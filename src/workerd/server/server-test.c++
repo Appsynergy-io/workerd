@@ -3149,6 +3149,83 @@ KJ_TEST("Server: the platform's settings name only the config's Workers") {
   )"_blockquote);
 }
 
+// AppSynergy: the platform's settings may let one service enable an experimental compatibility
+// flag without --experimental (apsy.capnp `Service.experimentalCompatibilityFlags`). The Worker
+// reports whether the flag took effect: Fetcher.queue() exists only under it.
+kj::String extraHandlersWorker() {
+  return singleWorker(R"((
+    compatibilityDate = "2024-01-01",
+    compatibilityFlags = ["service_binding_extra_handlers"],
+    modules = [
+      ( name = "main.js",
+        esModule =
+          `export default {
+          `  fetch(request, env) {
+          `    return new Response(typeof env.SELF.queue);
+          `  }
+          `}
+      )
+    ],
+    bindings = [(name = "SELF", service = "hello")]
+  ))"_kj);
+}
+
+KJ_TEST("Server: a service the platform lists may use its experimental flag") {
+  TestServer test(extraHandlersWorker());
+  test.server.setPlatform(R"((services = [
+    (name = "hello", experimentalCompatibilityFlags = ["service_binding_extra_handlers"])
+  ]))");
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "function");
+}
+
+KJ_TEST("Server: an experimental flag the platform does not list is refused") {
+  // Without settings, as upstream without --experimental.
+  {
+    TestServer test(extraHandlersWorker());
+    test.expectErrors(R"(
+      service hello: The compatibility flag service_binding_extra_handlers is experimental and may break or be removed in a future version of workerd. To use this flag, you must pass --experimental on the command line.
+    )"_blockquote);
+  }
+  // Settings for the service that list another flag, and settings that list this flag for
+  // another service, admit nothing.
+  {
+    TestServer test(extraHandlersWorker());
+    test.server.setPlatform(R"((services = [
+      (name = "hello", experimentalCompatibilityFlags = ["durable_object_rename"])
+    ]))");
+    test.expectErrors(R"(
+      service hello: The compatibility flag service_binding_extra_handlers is experimental and may break or be removed in a future version of workerd. To use this flag, you must pass --experimental on the command line.
+    )"_blockquote);
+  }
+  {
+    TestServer test(kj::str(R"((
+      services = [
+        ( name = "hello",
+          worker = (
+            compatibilityDate = "2024-01-01",
+            compatibilityFlags = ["service_binding_extra_handlers"],
+            modules = [(name = "main.js", esModule = "export default {}")]
+          )
+        ),
+        ( name = "other",
+          worker = (
+            compatibilityDate = "2024-01-01",
+            modules = [(name = "main.js", esModule = "export default {}")]
+          )
+        )
+      ]
+    ))"));
+    test.server.setPlatform(R"((services = [
+      (name = "other", experimentalCompatibilityFlags = ["service_binding_extra_handlers"])
+    ]))");
+    test.expectErrors(R"(
+      service hello: The compatibility flag service_binding_extra_handlers is experimental and may break or be removed in a future version of workerd. To use this flag, you must pass --experimental on the command line.
+    )"_blockquote);
+  }
+}
+
 KJ_TEST("Server: named images and directory snapshots are not startup sources") {
   TestServer test(R"((
     services = [

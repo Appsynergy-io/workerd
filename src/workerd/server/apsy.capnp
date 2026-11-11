@@ -44,6 +44,13 @@ struct Platform {
     # past `limits.memoryBytes` (server/rebuild.rs), beside each Worker's own allowance and the
     # process's, so that the Workers of one group cannot keep another group's from being rebuilt.
     # Unset or empty: the Worker is in no group, and only its own and the process's apply.
+
+    experimentalCompatibilityFlags @3 :List(Text);
+    # Compatibility flags annotated `$experimental` (io/compatibility-date.capnp) that this Worker
+    # may enable without `--experimental`: compileCompatibilityFlags()'s
+    # `allowedExperimentalFlags`. A flag not listed here is refused as upstream refuses it without
+    # `--experimental`; one listed that the Worker does not enable has no effect. With
+    # `--experimental` every such flag is admitted, as upstream. Unset: none.
   }
 
   struct Limits {
