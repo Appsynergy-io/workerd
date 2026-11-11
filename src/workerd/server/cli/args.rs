@@ -433,6 +433,15 @@ pub struct ServeArgs {
     /// development only.
     #[arg(long, value_name = "addr")]
     pub debug_port: Option<String>,
+
+    /// After the configuration is loaded and every socket and disk directory it names is open, and
+    /// before the event loop and V8 start, enter a user, mount and network namespace with an empty
+    /// read-only root, drop every capability, become non-dumpable and install a seccomp filter
+    /// that refuses path-based filesystem calls, every socket family but `AF_UNIX` and any signal
+    /// or handle to another process. Sockets must be UNIX domain sockets, and an external service
+    /// a socket file. Not compatible with --watch.
+    #[arg(long)]
+    pub sandbox: bool,
 }
 
 #[derive(Args, Debug)]

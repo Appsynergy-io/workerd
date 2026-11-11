@@ -93,8 +93,12 @@ wd_rust_crate(
         ":config-compiler",
     ],
     test_compile_data = ["//samples:wrangler/wrangler.jsonc"],
+    # The sandbox's TLS tests handshake in memory (cli/sandbox/linux-test.rs).
+    test_deps = ["@crates_vendor//:rustls"],
     deps = [
         ":workerd_capnp_rust",
+        # --sandbox reads the platform's TLS roots before the filesystem goes (cli/sandbox.rs).
+        "//src/rust/cxx/kj-hyper",
         "//src/rust/cxx/kj-rs-io",
         "//src/workerd/server/cluster",
         "//src/workerd/server/server:workerd-server",

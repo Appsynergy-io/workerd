@@ -63,3 +63,40 @@ fn a_loopback_socket_listens_in_process_with_no_peer_identity() {
         assert_eq!(peer_cf_blob(&accepted), None);
     });
 }
+
+/// A socket bound before the sandbox comes back bound and not registered with the event loop: a
+/// stream socket that does not listen reads as hung up, and a listener over it would be polled
+/// for ever. It listens, and is registered, once the services are built (run.rs).
+#[cfg(unix)]
+#[test]
+fn a_prebound_socket_stays_out_of_the_event_loop_until_it_listens() {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let config = message.init_root::<config::Builder>();
+        let mut sock = config.init_sockets(1).get(0);
+        sock.set_name("s");
+        sock.init_http();
+    }
+    let config = message.get_root_as_reader::<config::Reader>().unwrap();
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    let mut prebound = HashMap::from([("s".to_owned(), socket)]);
+    let report = Reporter::new(Box::new(|error| panic!("{error}")), Box::new(|_| {}), false);
+    let bound = runtime()
+        .block_on(bind_sockets(
+            config,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut prebound,
+            &Loopback::default(),
+            &report,
+        ))
+        .unwrap();
+    assert!(prebound.is_empty());
+    let [Some((socket, address))] = bound.sockets.as_slice() else {
+        panic!("one socket, bound");
+    };
+    assert!(matches!(socket, BoundSocket::Prebound(_)));
+    assert_eq!(address, "");
+    assert_eq!(bound_port(socket).unwrap(), 0);
+    assert!(bound.inbound.is_empty());
+}

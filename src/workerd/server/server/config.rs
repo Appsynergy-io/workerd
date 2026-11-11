@@ -458,6 +458,9 @@ fn escape_line_breaks(text: &str) -> String {
 pub struct Overrides {
     /// `--directory-path`: a disk service's path.
     pub directories: HashMap<String, String>,
+    /// A disk service's directory, opened by `--sandbox` before the filesystem went away: the
+    /// service reaches its entries relative to it (services/disk-root.rs).
+    pub opened_directories: HashMap<String, std::fs::File>,
     /// `--external-addr`: an external service's address.
     pub externals: HashMap<String, String>,
 }
@@ -1842,10 +1845,11 @@ async fn make_service(
                 .get(name)
                 .filter(|_| !report.from_deployment(name))
                 .map(String::as_str);
+            let opened = overrides.opened_directories.get(name);
             Ok(invalid_on_error(
                 name,
                 report,
-                crate::services::make_disk_directory_service(name, disk, path, factory)
+                crate::services::make_disk_directory_service(name, disk, path, opened, factory)
                     .map(Service::Disk),
             ))
         }

@@ -17,6 +17,10 @@
 
 #include <kj/memory.h>
 
+namespace kj {
+class Filesystem;
+}  // namespace kj
+
 namespace kj_rs_tokio {
 struct TokioAsyncIoContext;
 }  // namespace kj_rs_tokio
@@ -36,6 +40,11 @@ struct BuildInfo;
 ::rust::Slice<const uint8_t> release_version();
 bool perfetto_supported();
 bool fuzzilli_supported();
+// Opens the process's view of the disk (kj::newDiskFilesystem(), which holds descriptors on `/`
+// and the working directory) if it is not open yet. `--sandbox` calls it before it notes the
+// process's host descriptors, so both are pointed at the sandbox's root with the rest; after the
+// seccomp filter no path is opened from the working directory (cli/sandbox.rs).
+void open_disk_filesystem();
 
 // See the bridge (server/bridge.rs).
 int32_t with_process_context(
@@ -48,6 +57,8 @@ kj::Own<WorkerFactory> bootstrap(kj_rs_tokio::TokioAsyncIoContext& loop,
 BuildInfo build_info();
 ::rust::String newest_compat_date();
 [[noreturn]] void cli_exit(int32_t code);
+// The filesystem open_disk_filesystem() opened, opening it on first use.
+kj::Filesystem& diskFilesystem();
 void kj_log(uint8_t severity, ::rust::Str file, uint32_t line, ::rust::Str message);
 void json_log_to_stderr(uint8_t severity, ::rust::Str file, uint32_t line, ::rust::Str message);
 

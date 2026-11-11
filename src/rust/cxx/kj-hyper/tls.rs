@@ -16,6 +16,7 @@ use std::io;
 use std::slice;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use cxx::KjError;
 use cxx::KjExceptionType;
@@ -253,6 +254,79 @@ fn provider() -> Arc<CryptoProvider> {
     })
 }
 
+/// The platform's verifier over its own store, built once per process. On Linux building it reads
+/// the system's roots from files, which `--sandbox`'s seccomp filter refuses once it is installed,
+/// so the sandbox builds it first ([`load_platform_roots`]). A failure is kept, and reported to
+/// each configuration that trusts the platform's store, as building one reported it.
+static PLATFORM: OnceLock<std::result::Result<Arc<dyn ServerCertVerifier>, String>> =
+    OnceLock::new();
+
+fn platform_verifier() -> Result<Arc<dyn ServerCertVerifier>> {
+    PLATFORM
+        .get_or_init(|| {
+            rustls_platform_verifier::Verifier::new(provider())
+                .map(|verifier| Arc::new(verifier) as Arc<dyn ServerCertVerifier>)
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(config_error)
+}
+
+/// Reads the platform's store now, while the process can: `--sandbox` calls it before it removes
+/// the filesystem. A failure is reported later, to a configuration that trusts the store.
+pub fn load_platform_roots() {
+    let _ = platform_verifier();
+}
+
+/// The platform's store and the configured certificates, as one set of roots: a chain is trusted
+/// when it leads to a root in either.
+#[derive(Debug)]
+struct PlatformOrTrusted {
+    platform: Arc<dyn ServerCertVerifier>,
+    trusted: Arc<dyn ServerCertVerifier>,
+}
+
+impl ServerCertVerifier for PlatformOrTrusted {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.platform
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .or_else(|error| {
+                self.trusted
+                    .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                    .map_err(|_| error)
+            })
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.platform.supported_verify_schemes()
+    }
+}
+
 /// A client configuration: `keypair` is the client certificate, if any.
 ///
 /// # Errors
@@ -262,26 +336,25 @@ pub fn client_config(options: &TlsOptions) -> Result<Arc<rustls::ClientConfig>> 
     let provider = provider();
     let trusted = certificates(&options.trusted_certificates)?;
     // `trust_browser_cas` verifies with the platform, as OpenSSL uses the system's store: the
-    // platform's own verifier on macOS and Windows, webpki over the system's roots elsewhere.
-    let verifier: Option<Arc<dyn ServerCertVerifier>> = if options.trust_browser_cas {
-        Some(Arc::new(
-            rustls_platform_verifier::Verifier::new_with_extra_roots(
-                trusted.clone(),
-                provider.clone(),
-            )
-            .map_err(config_error)?,
-        ))
+    // platform's own verifier on macOS and Windows, webpki over the system's roots elsewhere. The
+    // trusted certificates are roots beside the store's.
+    let roots = roots(&trusted);
+    let configured: Option<Arc<dyn ServerCertVerifier>> = if roots.is_empty() {
+        None
     } else {
-        let roots = roots(&trusted);
-        if roots.is_empty() {
-            None
-        } else {
-            Some(
-                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-                    .build()
-                    .map_err(config_error)?,
-            )
-        }
+        Some(
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .map_err(config_error)?,
+        )
+    };
+    let verifier = match (options.trust_browser_cas, configured) {
+        (true, None) => Some(platform_verifier()?),
+        (true, Some(trusted)) => Some(Arc::new(PlatformOrTrusted {
+            platform: platform_verifier()?,
+            trusted,
+        }) as Arc<dyn ServerCertVerifier>),
+        (false, configured) => configured,
     };
     let verifier = PinnedVerifier {
         verifier,

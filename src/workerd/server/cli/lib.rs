@@ -8,8 +8,9 @@
 //! `deploy` publishes one ([`deploy`]).
 //! [`process::Process`] is the `--watch` half: the files to watch, and the reload.
 
-// Two modules allow `unsafe`: bridge.rs, whose `cxx::bridge` macro expands to FFI declarations,
-// and socket_fd.rs, where a descriptor number from the command line becomes an owned descriptor.
+// Three modules allow `unsafe`: bridge.rs, whose `cxx::bridge` macro expands to FFI declarations;
+// socket_fd.rs, where a descriptor number from the command line becomes an owned descriptor; and
+// sandbox.rs, whose namespaces, mounts and seccomp filter are system calls std does not wrap.
 // Everything else is safe code over std, socket2 and the bridge.
 
 mod args;
@@ -19,6 +20,7 @@ mod deploy;
 mod deployments;
 mod platform;
 mod process;
+mod sandbox;
 mod socket_fd;
 mod watch;
 mod wrangler;
@@ -98,9 +100,13 @@ fn run_compiled(
         usage_error::<T>(format!("the config compiled into this executable: {error}"))
     });
     let watcher = watcher::<T>(&args.serve_or_test, executable.as_ref());
+    let sandboxed = args.serve.sandbox;
     let (options, inherited_sockets) = serve_options::<T>(args.serve, &args.serve_or_test);
     let process = Process::new(executable, watcher, inherited_sockets);
-    let (config, options) = with_deployments(config, &args.serve_or_test, options, &process);
+    let (config, mut options) = with_deployments(config, &args.serve_or_test, options, &process);
+    if sandboxed {
+        enter_sandbox::<T>(&config, &mut options, &process);
+    }
     entry::serve(
         args.global.verbose,
         config.into_words(),
@@ -124,6 +130,7 @@ fn run_command(args: args::Main, executable: Option<Executable>) -> workerd_serv
         } => {
             check_serve_or_test::<T>(&serve_or_test);
             let watcher = watcher::<T>(&serve_or_test, executable.as_ref());
+            let sandboxed = serve.sandbox;
             let (options, inherited_sockets) = serve_options::<T>(serve, &serve_or_test);
             let process = Process::new(executable, watcher, inherited_sockets);
             let config = load_config::<T>(
@@ -132,7 +139,10 @@ fn run_command(args: args::Main, executable: Option<Executable>) -> workerd_serv
                 &process,
                 serve_or_test.experimental,
             );
-            let (config, options) = with_deployments(config, &serve_or_test, options, &process);
+            let (config, mut options) = with_deployments(config, &serve_or_test, options, &process);
+            if sandboxed {
+                enter_sandbox::<T>(&config, &mut options, &process);
+            }
             entry::serve(
                 verbose,
                 config.into_words(),
@@ -594,6 +604,22 @@ fn check_serve_or_test<T: CommandFactory>(serve_or_test: &args::ServeOrTestArgs)
     }
 }
 
+/// `--sandbox`: enters the sandbox once the config is loaded, before the event loop and V8 start
+/// (see sandbox.rs). Not with `--watch`, which nothing could serve once the filesystem is gone; a
+/// system call that fails ends the process before it serves.
+fn enter_sandbox<T: CommandFactory>(config: &Config, options: &mut RunOptions, process: &Process) {
+    if process.is_watching() {
+        usage_error::<T>(
+            "--sandbox and --watch cannot be combined: nothing is watched once the filesystem is \
+             gone.",
+        );
+    }
+    if let Err(error) = sandbox::enter(config, options) {
+        eprintln!("--sandbox: {error}");
+        std::process::exit(1);
+    }
+}
+
 /// The `serve` options for the server, taking ownership of every `--socket-fd` socket (the
 /// server gets a duplicate). A socket given both an address and a descriptor, or a descriptor that
 /// is not a listening socket, is a usage error.
@@ -683,6 +709,7 @@ fn run_options(serve_or_test: &args::ServeOrTestArgs) -> RunOptions {
         overrides: Overrides {
             directories: args::override_map(serve_or_test.directory_overrides.clone()),
             externals: args::override_map(serve_or_test.external_overrides.clone()),
+            ..Overrides::default()
         },
         inspector: serve_or_test.inspector_addr.clone(),
         ..RunOptions::default()

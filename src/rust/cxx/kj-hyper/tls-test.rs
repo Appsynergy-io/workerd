@@ -680,3 +680,120 @@ fn a_p521_server_keys_handshake_signatures_are_verified() {
         P521_SHA512_SIGNATURE
     ));
 }
+
+// AppSynergy: `trust_browser_cas` with the platform's store. The store is read once per process
+// (`platform_verifier`), before `--sandbox` removes the filesystem; these tests put a stand-in in
+// its place, a CA no system trusts, so that a "public" chain can be signed here: STAND_IN_CA, and
+// over HOST_KEY an example.com certificate it signed. Valid from 2026-11-11 for a century.
+const STAND_IN_CA_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBtjCCAVugAwIBAgIUQEjDSkSWhXZU80Pz8AaKVu6x6lAwCgYIKoZIzj0EAwIw
+JzElMCMGA1UEAwwcd29ya2VyZCBwbGF0Zm9ybSBzdGFuZC1pbiBDQTAgFw0yNjEx
+MTEyMDE3NDRaGA8yMTI2MTAxODIwMTc0NFowJzElMCMGA1UEAwwcd29ya2VyZCBw
+bGF0Zm9ybSBzdGFuZC1pbiBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCes
+NDjx+WM0LrGNXGU9LZSfvZ++3feagva5YV4AsJx8q6jFIB5gytaL7N0v6ZHHgU5N
+z/6eJ2XJNh2G+eRYa1GjYzBhMB0GA1UdDgQWBBQhl0ZvTc8biscsf2rvYiJWjjTu
+MTAfBgNVHSMEGDAWgBQhl0ZvTc8biscsf2rvYiJWjjTuMTAPBgNVHRMBAf8EBTAD
+AQH/MA4GA1UdDwEB/wQEAwICBDAKBggqhkjOPQQDAgNJADBGAiEAg+bVV/ZATh5r
+rZQB+pmguXG0jrvXkFn0NVRfmH7DJOgCIQC7AxSpJRtESfrGRFu1CT+MBYx3I2z0
+6R1FU6HZKfjtLA==
+-----END CERTIFICATE-----
+";
+
+const STAND_IN_HOST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIB0TCCAXagAwIBAgIUezydwEq2q5SLbD0YsGEdvMtKVswwCgYIKoZIzj0EAwIw
+JzElMCMGA1UEAwwcd29ya2VyZCBwbGF0Zm9ybSBzdGFuZC1pbiBDQTAgFw0yNjEx
+MTEyMDE3NDRaGA8yMTI2MTAxODIwMTc0NFowFjEUMBIGA1UEAwwLZXhhbXBsZS5j
+b20wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQnOfu5cpedB9zB1mMhAIDW8ZyI
+THOkwbUe1r6aelzgYOws2jgmRcIseDI/Clz6MoYu8YDUFSgIBNZmkwj1T5Qdo4GO
+MIGLMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsG
+AQUFBwMBMBYGA1UdEQQPMA2CC2V4YW1wbGUuY29tMB0GA1UdDgQWBBThaanlqsTW
+j7ZQZ3M5zlyt+EpbITAfBgNVHSMEGDAWgBQhl0ZvTc8biscsf2rvYiJWjjTuMTAK
+BggqhkjOPQQDAgNJADBGAiEA8Myf52B8VvZ4qmCdf7hLRg85vEWi42n3OwLMarJw
+8Z8CIQDO+qdJH+/y0XPqZ87zP4oZ0NhUHEflWW/yGpH6WFpUbA==
+-----END CERTIFICATE-----
+";
+
+/// Makes STAND_IN_CA_CERT the platform's store for this test process. Every test that turns
+/// `trust_browser_cas` on calls it before building a client, so the real store is never read.
+fn stand_in_platform_store() {
+    let _ = PLATFORM.get_or_init(|| {
+        let roots = roots(&certificates(&[STAND_IN_CA_CERT.to_owned()]).unwrap());
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
+            .build()
+            .map(|verifier| verifier as Arc<dyn ServerCertVerifier>)
+            .map_err(|e| e.to_string())
+    });
+}
+
+fn browser_cas(trusted: &[&str]) -> TlsOptions {
+    stand_in_platform_store();
+    TlsOptions {
+        trust_browser_cas: true,
+        trusted_certificates: trusted.iter().map(|&cert| cert.to_owned()).collect(),
+        ..TlsOptions::default()
+    }
+}
+
+#[test]
+fn browser_cas_accept_a_chain_to_the_platforms_store() {
+    assert!(connects(
+        &serving(STAND_IN_HOST_CERT),
+        &browser_cas(&[]),
+        "example.com"
+    ));
+    assert!(!connects(
+        &serving(HOST_CERT),
+        &browser_cas(&[]),
+        "example.com"
+    ));
+    assert!(!connects(
+        &serving(STAND_IN_HOST_CERT),
+        &browser_cas(&[]),
+        "wrong.example.com"
+    ));
+}
+
+#[test]
+fn with_browser_cas_a_private_root_is_trusted_beside_the_store() {
+    let client = browser_cas(&[CA_CERT]);
+    assert!(connects(&serving(HOST_CERT), &client, "example.com"));
+    assert!(connects(
+        &serving(STAND_IN_HOST_CERT),
+        &client,
+        "example.com"
+    ));
+    assert!(!connects(&serving(HOST_CERT), &client, "wrong.example.com"));
+    assert!(!connects(
+        &serving(HOST_CERT),
+        &browser_cas(&[OTHER_CA_CERT]),
+        "example.com"
+    ));
+}
+
+#[test]
+fn without_browser_cas_a_private_root_is_the_only_one() {
+    stand_in_platform_store();
+    let client = trusting(CA_CERT);
+    assert!(connects(&serving(HOST_CERT), &client, "example.com"));
+    assert!(!connects(
+        &serving(STAND_IN_HOST_CERT),
+        &client,
+        "example.com"
+    ));
+}
+
+#[test]
+fn with_browser_cas_a_pinned_certificate_is_trusted_directly() {
+    let client = browser_cas(&[SELF_SIGNED_CERT]);
+    assert!(connects(&serving(SELF_SIGNED_CERT), &client, "example.com"));
+    assert!(connects(
+        &serving(STAND_IN_HOST_CERT),
+        &client,
+        "example.com"
+    ));
+    assert!(!connects(
+        &serving(SELF_SIGNED_CERT),
+        &client,
+        "wrong.example.com"
+    ));
+}

@@ -136,7 +136,23 @@ impl StreamListener {
 pub enum BoundSocket {
     Stream(StreamListener),
     Datagram(UdpSocket),
+    /// A socket bound before the sandbox (`--sandbox`), not yet listening. It is registered with
+    /// the event loop only once it listens ([`listen_prebound`]): a stream socket that does not
+    /// listen reads as hung up, and the loop would poll its listener for ever.
+    Prebound(socket2::Socket),
 }
+
+/// Listens on a prebound socket, once the services are built, and wraps it as an inherited one.
+pub fn listen_prebound(socket: socket2::Socket) -> Result<StreamListener> {
+    socket
+        .listen(SOMAXCONN)
+        .map_err(|e| kj::failed!("listen(): {e}"))?;
+    wrap_inherited(socket)
+}
+
+/// The backlog of a socket bound before the sandbox: Linux's `SOMAXCONN`, which the kernel caps at
+/// `net.core.somaxconn`.
+const SOMAXCONN: i32 = 4096;
 
 /// Listens on `address`; a loopback address takes its name's listener from `loopback`.
 pub async fn listen(
@@ -177,8 +193,11 @@ pub struct BoundSockets {
     pub inbound: HashMap<String, Vec<ffi::InboundListener>>,
 }
 
-/// Binds every socket of the config, taking the CLI's overrides for it out of `addresses` and
-/// `inherited` (what is left in them matched no socket). Bind failures are config errors.
+/// Binds every socket of the config, taking the CLI's overrides for it out of `addresses`,
+/// `inherited` and `prebound` (what is left in them matched no socket). Bind failures are config
+/// errors. A prebound socket (`--sandbox`, a UNIX domain socket) is bound and not yet listening:
+/// it is returned as [`BoundSocket::Prebound`], which the caller listens on once the services are
+/// built.
 #[expect(
     clippy::implicit_hasher,
     reason = "the maps are the command line's, with the default hasher"
@@ -187,6 +206,7 @@ pub async fn bind_sockets(
     config: config::Reader<'_>,
     addresses: &mut HashMap<String, String>,
     inherited: &mut HashMap<String, socket2::Socket>,
+    prebound: &mut HashMap<String, socket2::Socket>,
     loopback: &Loopback,
     report: &Reporter,
 ) -> Result<BoundSockets> {
@@ -198,9 +218,10 @@ pub async fn bind_sockets(
         let name = text(sock.get_name())?;
         let is_udp = matches!(sock.which(), Ok(socket::Which::Udp(_)));
         let inherited_listener = inherited.remove(&name);
+        let prebound_socket = prebound.remove(&name);
         let address = if let Some(address) = addresses.remove(&name) {
             address
-        } else if inherited_listener.is_some() {
+        } else if inherited_listener.is_some() || prebound_socket.is_some() {
             String::new()
         } else if sock.has_address() {
             text(sock.get_address())?
@@ -214,7 +235,7 @@ pub async fn bind_sockets(
         };
 
         if is_udp {
-            if inherited_listener.is_some() {
+            if inherited_listener.is_some() || prebound_socket.is_some() {
                 report.error(format!(
                     "Socket \"{name}\" is a UDP socket; --socket-fd overrides (which pass a \
                      listening connection-oriented socket) are not supported for it."
@@ -236,6 +257,13 @@ pub async fn bind_sockets(
             continue;
         }
 
+        // A UNIX domain socket, so not among the TCP listeners `inbound` names.
+        if let Some(socket) = prebound_socket {
+            bound
+                .sockets
+                .push(Some((BoundSocket::Prebound(socket), address)));
+            continue;
+        }
         let listener = match inherited_listener {
             Some(socket) => wrap_inherited(socket),
             None => listen(&address, default_port_for(sock), loopback).await,
@@ -281,6 +309,8 @@ pub fn bound_port(socket: &BoundSocket) -> Result<u16> {
             .local_addr()
             .map(|addr| addr.port())
             .map_err(|e| kj::failed!("getsockname: {e}")),
+        // A UNIX domain socket, whose port KJ reports as 0.
+        BoundSocket::Prebound(_) => Ok(0),
     }
 }
 

@@ -62,6 +62,7 @@ wd_rust_crate(
         "@crates_vendor//:url",
     ] + select({
         "@platforms//os:windows": ["@crates_vendor//:windows-sys"],
-        "//conditions:default": [],
+        # The disk service's *at calls (services/disk-root.rs).
+        "//conditions:default": ["@crates_vendor//:nix"],
     }),
 )

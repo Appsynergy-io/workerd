@@ -68,8 +68,9 @@ libm = "0"
 lol_html_c_api = { git = "https://github.com/cloudflare/lol-html" }
 hashlink = "0"
 # kj-rs-io: `fs` for fcntl (KJ's fd flags), `signal` for ignoring SIGPIPE once per process like
-# kj::UnixEventPort does.
-nix = { version = "0", features = ["fs", "signal"] }
+# kj::UnixEventPort does. The server's disk service: `fs` and `dir` for the *at calls and the
+# listing relative to its directory, as kj::Directory reaches entries.
+nix = { version = "0", features = ["dir", "fs", "signal"] }
 pico-args = "0"
 # kj-hyper: WebSocket keys and frame masks. Every Cargo.toml merged into the crate_universe
 # workspace (downstream repos include this one alongside their own) must request the same

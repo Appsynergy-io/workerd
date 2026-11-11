@@ -207,11 +207,11 @@ class Bootstrap {
       applyBenchOptions(*options, b);
     }
     return kj::heap<WorkerFactory>(*v8System, timer, monotonicClock, provider.getNetwork(),
-        entropySource, *fs, kj::mv(options), kj::mv(configWords));
+        entropySource, fs, kj::mv(options), kj::mv(configWords));
   }
 
  private:
-  kj::Own<kj::Filesystem> fs = kj::newDiskFilesystem();
+  kj::Filesystem& fs = diskFilesystem();
   EntropySourceImpl entropySource;
   kj::Timer& timer;
   // The loop's monotonic clock, consistent with `timer`.
@@ -231,7 +231,7 @@ class Bootstrap {
   kj::Own<jsg::V8System> v8System;
 
   kj::Maybe<kj::Own<const kj::Directory>> openWritableDirectory(kj::StringPtr pathStr) {
-    return fs->getRoot().tryOpenSubdir(fs->getCurrentPath().eval(pathStr), kj::WriteMode::MODIFY);
+    return fs.getRoot().tryOpenSubdir(fs.getCurrentPath().eval(pathStr), kj::WriteMode::MODIFY);
   }
 
   void applyServeOrTestOptions(
@@ -253,7 +253,7 @@ class Bootstrap {
     KJ_IF_SOME(path, serveOrTest.pyodide_bundle_disk_cache_dir) {
       // Resolved as kj resolves paths, so `..` is taken lexically (`file/..` names the file's
       // directory).
-      auto dir = fs->getCurrentPath().eval(kj::str(path)).toNativeString(true);
+      auto dir = fs.getCurrentPath().eval(kj::str(path)).toNativeString(true);
       // The server takes the directory as UTF-8, which the working directory need not be.
       KJ_REQUIRE(!kj::encodeUtf16(dir).hadErrors,
           "--pyodide-bundle-disk-cache-dir does not resolve to a UTF-8 path", dir);
@@ -338,6 +338,17 @@ bool fuzzilli_supported() {
 #else
   return false;
 #endif
+}
+
+kj::Filesystem& diskFilesystem() {
+  // Process-wide and never destroyed: the sandbox points its descriptors at the new root in place,
+  // and isolates may still read through it while the process exits.
+  static auto* const fs = new kj::Own<kj::Filesystem>(kj::newDiskFilesystem());
+  return **fs;
+}
+
+void open_disk_filesystem() {
+  diskFilesystem();
 }
 
 int32_t with_process_context(

@@ -55,6 +55,10 @@ pub mod ffi {
         fn release_version() -> &'static [u8];
         fn perfetto_supported() -> bool;
         fn fuzzilli_supported() -> bool;
+        /// Opens the process's disk filesystem, which holds descriptors on `/` and the working
+        /// directory, if it is not open yet: `--sandbox` calls it before it notes the host's
+        /// descriptors (sandbox.rs).
+        fn open_disk_filesystem() -> Result<()>;
     }
 
     extern "Rust" {

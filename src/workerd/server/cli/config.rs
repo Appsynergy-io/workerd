@@ -99,6 +99,14 @@ impl Config {
         bytes_from_words(&self.0)
     }
 
+    /// The message, to read the `Config` from (`get_root::<config::Reader>()`) before the server
+    /// has it (`--sandbox`).
+    pub fn message(
+        &self,
+    ) -> capnp::Result<capnp::message::Reader<capnp::serialize::OwnedSegments>> {
+        capnp::serialize::read_message(&mut bytes_from_words(&self.0).as_slice(), reader_options())
+    }
+
     /// Writes the encoded config to stdout (`compile --config-only`).
     pub fn write_to_stdout(&self) -> io::Result<()> {
         let mut out = io::stdout().lock();

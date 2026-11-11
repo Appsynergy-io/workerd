@@ -9,7 +9,8 @@
 //! worker's `durableObjectStorage.localDisk` names.
 //!
 //! Disk I/O is synchronous, as it is in `kj::Directory`: the files are local, and the loop
-//! thread reads them in 64 KiB steps between writes to the response.
+//! thread reads them in 64 KiB steps between writes to the response. Entries are reached relative
+//! to the directory, held open (disk-root.rs).
 
 use std::io::Read;
 use std::io::Seek;
@@ -55,6 +56,13 @@ use crate::services::header_table;
 use crate::services::not_transferable;
 use crate::services::send_error;
 use crate::services::unsupported;
+
+#[path = "disk-root.rs"]
+mod root;
+
+use root::Kind;
+use root::Metadata;
+use root::Root;
 
 // =======================================================================================
 // Pure parts
@@ -135,52 +143,21 @@ pub fn parse_range(header: &str, length: u64) -> Range {
     }
 }
 
-/// A directory entry's type, as the listing names it.
-fn entry_type(file_type: std::fs::FileType) -> &'static str {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if file_type.is_block_device() {
-            return "blockDevice";
-        }
-        if file_type.is_char_device() {
-            return "characterDevice";
-        }
-        if file_type.is_fifo() {
-            return "namedPipe";
-        }
-        if file_type.is_socket() {
-            return "socket";
-        }
-    }
-    if file_type.is_symlink() {
-        "symlink"
-    } else if file_type.is_dir() {
-        "directory"
-    } else if file_type.is_file() {
-        "file"
-    } else {
-        "other"
-    }
-}
-
 // =======================================================================================
 // The service
 
 struct Disk {
     factory: Rc<Factory>,
-    root: PathBuf,
+    /// The directory's path, which Durable Object storage opens it by.
+    path: PathBuf,
+    root: Root,
     writable: bool,
     allow_dotfiles: bool,
 }
 
-impl Disk {
-    /// The path below the root the segments name; the segments passed validation.
-    fn join(&self, segments: &[String]) -> PathBuf {
-        segments
-            .iter()
-            .fold(self.root.clone(), |path, segment| path.join(segment))
-    }
+/// The path below the root the segments name; the segments passed validation.
+fn relative(segments: &[String]) -> PathBuf {
+    segments.iter().collect()
 }
 
 /// A `disk` service: a directory served over HTTP, and the directory a worker's
@@ -191,7 +168,7 @@ impl DiskDirectoryService {
     /// The directory's path when the service is writable, which Durable Object storage needs.
     #[must_use]
     pub fn writable_path(&self) -> Option<&str> {
-        self.0.writable.then(|| self.0.root.to_str()).flatten()
+        self.0.writable.then(|| self.0.path.to_str()).flatten()
     }
 }
 
@@ -205,11 +182,13 @@ impl Channel for DiskDirectoryService {
     }
 }
 
-/// `path_override` is the CLI's `--directory-path` for this service.
+/// `path_override` is the CLI's `--directory-path` for this service, and `opened` the directory
+/// `--sandbox` opened at that path before the process entered it.
 pub fn make_disk_directory_service(
     name: &str,
     conf: disk_directory::Reader<'_>,
     path_override: Option<&str>,
+    opened: Option<&std::fs::File>,
     factory: &Rc<Factory>,
 ) -> Result<Rc<DiskDirectoryService>> {
     let path = match path_override {
@@ -222,14 +201,19 @@ pub fn make_disk_directory_service(
             ));
         }
     };
-    let root = std::env::current_dir()
+    let full = std::env::current_dir()
         .map_err(|e| io_kj_error(&e))?
         .join(&path);
-    if !root.is_dir() {
+    let root = match opened {
+        Some(file) => Root::opened(file),
+        None => Root::open(&full),
+    };
+    let Ok(root) = root else {
         return Err(kj::failed!("Directory named \"{name}\" not found: {path}"));
-    }
+    };
     Ok(Rc::new(DiskDirectoryService(Rc::new(Disk {
         factory: Rc::clone(factory),
+        path: full,
         root,
         writable: conf.get_writable(),
         allow_dotfiles: conf.get_allow_dotfiles(),
@@ -255,14 +239,15 @@ fn len_u64(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
 }
 
-/// Copies `length` bytes of the file from `start` into `out`.
+/// Copies `length` bytes of the file at `path` from `start` into `out`.
 async fn copy_file(
+    root: &Root,
     path: &Path,
     start: u64,
     length: u64,
     out: &mut kj::io::AsyncOutputStream<'_>,
 ) -> Result<()> {
-    let mut file = std::fs::File::open(path).map_err(|e| io_kj_error(&e))?;
+    let mut file = root.open_file(path).map_err(|e| io_kj_error(&e))?;
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start))
             .map_err(|e| io_kj_error(&e))?;
@@ -286,29 +271,36 @@ async fn copy_file(
 }
 
 /// A file that is removed when dropped, unless it was renamed away first.
-struct Temporary(PathBuf);
+struct Temporary<'r>(&'r Root, PathBuf);
 
-impl Drop for Temporary {
+impl Drop for Temporary<'_> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = self.0.remove_file(&self.1);
     }
 }
 
 /// Writes the body to a temporary file beside `path`, then renames it into place, so that a
 /// reader never sees a partial file. A write that fails or is abandoned leaves nothing behind.
-async fn write_replacing(path: &Path, mut body: Pin<&mut AsyncInputStream>) -> Result<()> {
+async fn write_replacing(
+    root: &Root,
+    path: &Path,
+    mut body: Pin<&mut AsyncInputStream>,
+) -> Result<()> {
     static NONCE: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io_kj_error(&e))?;
+        root.create_dir_all(parent).map_err(|e| io_kj_error(&e))?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-    let temp = Temporary(path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        name.unwrap_or_default(),
-        std::process::id(),
-        NONCE.fetch_add(1, Ordering::Relaxed)
-    )));
-    let mut file = std::fs::File::create(&temp.0).map_err(|e| io_kj_error(&e))?;
+    let temp = Temporary(
+        root,
+        path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            name.unwrap_or_default(),
+            std::process::id(),
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        )),
+    );
+    let mut file = root.create(&temp.1).map_err(|e| io_kj_error(&e))?;
     let mut buffer = vec![0; 64 * 1024];
     loop {
         let read = body.as_mut().try_read(&mut buffer, 1).await?;
@@ -319,23 +311,7 @@ async fn write_replacing(path: &Path, mut body: Pin<&mut AsyncInputStream>) -> R
             .map_err(|e| io_kj_error(&e))?;
     }
     drop(file);
-    std::fs::rename(&temp.0, path).map_err(|e| io_kj_error(&e))
-}
-
-/// Removes a file, or a directory and everything in it; false when there was nothing there.
-fn remove(path: &Path) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(io_kj_error(&e)),
-    };
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
-    .map_err(|e| io_kj_error(&e))?;
-    Ok(true)
+    root.rename(&temp.1, path).map_err(|e| io_kj_error(&e))
 }
 
 struct DiskRequest(Rc<Disk>);
@@ -345,18 +321,18 @@ impl DiskRequest {
         &self,
         method: Method,
         path: &Path,
-        metadata: &std::fs::Metadata,
+        metadata: &Metadata,
         request_headers: HeadersRef<'_>,
         response: ServiceResponse<'_>,
     ) -> Result<()> {
         let table = header_table(&self.0.factory);
-        let size = metadata.len();
+        let size = metadata.len;
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
             header_value("application/octet-stream")?,
         );
-        if let Ok(modified) = metadata.modified() {
+        if let Some(modified) = metadata.modified {
             headers.insert(
                 http::header::LAST_MODIFIED,
                 header_value(fmt_http_date(modified))?,
@@ -403,14 +379,14 @@ impl DiskRequest {
         if method == Method::HEAD {
             return Ok(());
         }
-        copy_file(path, start, length, &mut out).await
+        copy_file(&self.0.root, path, start, length, &mut out).await
     }
 
     async fn directory(
         &self,
         method: Method,
         path: &Path,
-        metadata: &std::fs::Metadata,
+        metadata: &Metadata,
         response: ServiceResponse<'_>,
     ) -> Result<()> {
         let table = header_table(&self.0.factory);
@@ -419,7 +395,7 @@ impl DiskRequest {
             http::header::CONTENT_TYPE,
             header_value("application/json")?,
         );
-        if let Ok(modified) = metadata.modified() {
+        if let Some(modified) = metadata.modified {
             headers.insert(
                 http::header::LAST_MODIFIED,
                 header_value(fmt_http_date(modified))?,
@@ -432,14 +408,11 @@ impl DiskRequest {
             return Ok(());
         }
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path).map_err(|e| io_kj_error(&e))? {
-            let entry = entry.map_err(|e| io_kj_error(&e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for (name, kind) in self.0.root.read_dir(path).map_err(|e| io_kj_error(&e))? {
             if !self.0.allow_dotfiles && name.starts_with('.') {
                 continue;
             }
-            let kind = entry.file_type().map_or("other", entry_type);
-            entries.push((name, kind));
+            entries.push((name, kind.name()));
         }
         entries.sort();
         let listing = entries
@@ -473,13 +446,13 @@ impl Service for DiskRequest {
                 let Some(segments) = segments else {
                     return send_error(response, 404, "Not Found", &none).await;
                 };
-                let path = disk.join(&segments);
-                let Ok(metadata) = std::fs::metadata(&path) else {
+                let path = relative(&segments);
+                let Ok(metadata) = disk.root.metadata(&path) else {
                     return send_error(response, 404, "Not Found", &none).await;
                 };
-                if metadata.is_file() {
+                if metadata.kind == Kind::File {
                     self.file(method, &path, &metadata, headers, response).await
-                } else if metadata.is_dir() {
+                } else if metadata.kind == Kind::Directory {
                     self.directory(method, &path, &metadata, response).await
                 } else {
                     send_error(response, 406, "Not Acceptable", &none).await
@@ -492,10 +465,10 @@ impl Service for DiskRequest {
                 let Some(segments) = segments.filter(|segments| !segments.is_empty()) else {
                     return send_error(response, 403, "Unauthorized", &none).await;
                 };
-                let path = disk.join(&segments);
+                let path = relative(&segments);
                 if method == Method::PUT {
-                    write_replacing(&path, request_body).await?;
-                } else if !remove(&path)? {
+                    write_replacing(&disk.root, &path, request_body).await?;
+                } else if !disk.root.remove(&path).map_err(|e| io_kj_error(&e))? {
                     return send_error(response, 404, "Not Found", &none).await;
                 }
                 response.send(204, "No Content", &none, None)?;

@@ -78,6 +78,13 @@ pub struct RunOptions {
     /// `--platform-config` or `--platform-config-fd`: the platform's settings (apsy.capnp
     /// `Platform`) as an encoded message; none to run every Worker as upstream workerd does.
     pub platform: Option<Vec<u64>>,
+    /// `--sandbox`: the sockets bound before the process entered its sandbox, by socket name,
+    /// bound and not yet listening; each listens once the services are built, so a supervisor
+    /// that connects knows the process serves (cli/sandbox.rs).
+    pub prebound: HashMap<String, socket2::Socket>,
+    /// The config's errors the command line found before the server existed (`--sandbox`'s),
+    /// reported with the server's.
+    pub config_errors: Vec<String>,
 }
 
 /// The control channel (`--control-fd`), written line by line; a failed write is logged. The
@@ -165,10 +172,14 @@ async fn start(
     platform.check_against(config, &report)?;
     factory.set_platform(platform)?;
 
+    for error in std::mem::take(&mut options.config_errors) {
+        report.error(error);
+    }
     let bound = listen::bind_sockets(
         config,
         &mut options.socket_addresses,
         &mut options.socket_fds,
+        &mut options.prebound,
         factory.loopback(),
         &report,
     )
@@ -216,6 +227,8 @@ async fn start(
     });
     let mut listeners = FuturesUnordered::new();
     let mut ports = Vec::new();
+    // The sockets bound before the sandbox, listened on once the config is accepted.
+    let mut prebound = Vec::new();
     let sockets = config.get_sockets().map_err(capnp_error)?;
     for (sock, bound) in sockets.iter().zip(bound.sockets) {
         // A socket that failed to bind already reported its error.
@@ -235,6 +248,10 @@ async fn start(
         }
         let channel = server.lookup(&designator);
         ports.push((name, listen::bound_port(&bound)?));
+        if let BoundSocket::Prebound(socket) = bound {
+            prebound.push((sock, socket, address, channel));
+            continue;
+        }
         if let Some(listener) =
             listener(Rc::clone(&context), sock, bound, &address, channel, &server)?
         {
@@ -250,6 +267,16 @@ async fn start(
     if let (Some(node), Some((listener, _))) = (server.cluster(), cluster_port) {
         control.listen_cluster(&listener)?;
         start_cluster(&factory, node, listener);
+    }
+    // Every worker is built: the sockets bound before the sandbox may accept connections now, and
+    // each is registered with the event loop once it listens.
+    for (sock, socket, address, channel) in prebound {
+        let bound = BoundSocket::Stream(listen::listen_prebound(socket)?);
+        if let Some(listener) =
+            listener(Rc::clone(&context), sock, bound, &address, channel, &server)?
+        {
+            listeners.push(listener);
+        }
     }
     for (name, port) in ports {
         control.listen(&name, port);
