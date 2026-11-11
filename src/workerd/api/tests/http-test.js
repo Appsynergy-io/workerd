@@ -177,6 +177,7 @@ export const test = {
   fetcher: null,
   signal: AbortSignal { aborted: false, reason: undefined, onabort: null },
   cf: undefined,
+  apsy: undefined,
   integrity: '',
   keepalive: false,
   cache: undefined,
@@ -200,6 +201,7 @@ export const test = {
   fetcher: null,
   signal: AbortSignal { aborted: false, reason: undefined, onabort: null },
   cf: undefined,
+  apsy: undefined,
   integrity: '',
   keepalive: false,
   body: ReadableStream {

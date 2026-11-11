@@ -934,6 +934,7 @@ class Request final: public Body {
       JSG_READONLY_PROTOTYPE_PROPERTY(fetcher, getFetcher);
       JSG_READONLY_PROTOTYPE_PROPERTY(signal, getThisSignal);
       JSG_READONLY_PROTOTYPE_PROPERTY(cf, getCf);
+      JSG_READONLY_PROTOTYPE_PROPERTY(apsy, getCf);
 
       // TODO(conform): These are standard properties that we do not implement (see descriptions
       // above).
@@ -983,6 +984,7 @@ class Request final: public Body {
       JSG_READONLY_INSTANCE_PROPERTY(fetcher, getFetcher);
       JSG_READONLY_INSTANCE_PROPERTY(signal, getThisSignal);
       JSG_READONLY_INSTANCE_PROPERTY(cf, getCf);
+      JSG_READONLY_INSTANCE_PROPERTY(apsy, getCf);
 
       // TODO(conform): These are standard properties that we do not implement (see descriptions
       // above).

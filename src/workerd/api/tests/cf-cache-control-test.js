@@ -242,3 +242,32 @@ export const cacheOptionSerialization = {
     assert.strictEqual(ttlCf.cacheControl, 'max-age=300');
   },
 };
+
+// request.apsy is a second name for request.cf: the same getter result, the same object instance.
+export const requestApsyIsTheCfObject = {
+  async test(ctrl, env, ctx) {
+    const req = new Request('https://example.org', {
+      cf: { cacheTtl: 300, cacheEverything: true },
+    });
+    assert.ok(req.cf);
+    assert.strictEqual(req.apsy, req.cf);
+    assert.strictEqual(req.apsy.cacheTtl, 300);
+    assert.strictEqual(req.apsy.cacheEverything, true);
+
+    // A copy made from the request carries the same cf object under both names.
+    const copy = new Request(req);
+    assert.strictEqual(copy.apsy, copy.cf);
+    assert.deepStrictEqual(copy.apsy, req.cf);
+
+    // Without a cf object, both are undefined.
+    const plain = new Request('https://example.org');
+    assert.strictEqual(plain.cf, undefined);
+    assert.strictEqual(plain.apsy, undefined);
+
+    // Read-only, as cf is: assigning it in strict mode throws and leaves it unchanged.
+    assert.throws(() => {
+      req.apsy = {};
+    }, TypeError);
+    assert.strictEqual(req.apsy, req.cf);
+  },
+};
