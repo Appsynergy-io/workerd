@@ -686,6 +686,7 @@ impl Drop for Server {
 pub fn collect_actor_configs(
     config: config::Reader<'_>,
     experimental: bool,
+    platform: &Platform,
     report: &Reporter,
 ) -> capnp::Result<ActorConfigs> {
     // Every `uniqueKey` in the config, which no Workflow namespace key may collide with. The pass
@@ -717,6 +718,7 @@ pub fn collect_actor_configs(
             service_index,
             service_conf,
             experimental,
+            platform,
             &durable_namespace_keys,
             &mut workflow_namespace_keys,
             report,
@@ -761,11 +763,16 @@ fn check_bundled(
 }
 
 /// [`collect_actor_configs`] for the service `name`, whose config is `service_conf`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pass's shared state, passed as `collect_actor_configs` holds it"
+)]
 fn collect_service_actor_configs(
     name: &str,
     service_index: u32,
     service_conf: service::Reader<'_>,
     experimental: bool,
+    platform: &Platform,
     durable_namespace_keys: &HashSet<String>,
     workflow_namespace_keys: &mut HashSet<String>,
     report: &Reporter,
@@ -777,6 +784,8 @@ fn collect_service_actor_configs(
     let worker_conf = worker_conf?;
     check_bundled(name, worker_conf, experimental, report)?;
     let mut had_durable = false;
+    // The platform's limit for the Worker's objects (apsy.capnp `durableObjectStorageBytes`).
+    let max_storage_bytes = platform.durable_object_storage_bytes(name);
     for (namespace_index, ns) in (0..).zip(worker_conf.get_durable_object_namespaces()?) {
         let class_name = ns.get_class_name()?.to_string()?;
         match ns.which() {
@@ -793,6 +802,7 @@ fn collect_service_actor_configs(
                             service_index,
                             namespace_index,
                         }),
+                        max_storage_bytes,
                     },
                 );
             }
@@ -981,6 +991,7 @@ fn collect_workflow_configs(
                     binding_service,
                 })),
                 container: None,
+                max_storage_bytes: 0,
             },
         );
     }
@@ -1464,7 +1475,8 @@ impl Server {
         // First pass: the actor configs, which bindings to other workers' classes are checked
         // against.
         let actor_configs =
-            collect_actor_configs(config, factory.experimental(), &report).map_err(capnp_error)?;
+            collect_actor_configs(config, factory.experimental(), &factory.platform(), &report)
+                .map_err(capnp_error)?;
 
         // Second pass: the services.
         let mut services = Services::default();

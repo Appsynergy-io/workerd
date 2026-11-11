@@ -39,6 +39,7 @@ wd_cc_library(
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
         ":apsy-limits",
+        ":apsy-storage-cap",
         ":worker-factory-hdrs",
         "//src/rust/worker:bridge",
         "//src/workerd/api:memory-cache",
@@ -82,6 +83,21 @@ wd_cc_library(
 kj_test(
     src = "apsy-limits-test.c++",
     deps = [":apsy-limits"],
+)
+
+wd_cc_library(
+    name = "apsy-storage-cap",
+    srcs = ["apsy-storage-cap.c++"],
+    hdrs = ["apsy-storage-cap.h"],
+    deps = ["//src/workerd/util:sqlite"],
+)
+
+kj_test(
+    src = "apsy-storage-cap-test.c++",
+    deps = [
+        ":apsy-storage-cap",
+        "//src/workerd/util:sqlite",
+    ],
 )
 
 # The declarations both bridges (the command line's and the server's) need from :bootstrap.

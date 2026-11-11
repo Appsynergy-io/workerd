@@ -72,5 +72,13 @@ struct Platform {
     # invocation that takes the isolate past it ends as `exceededMemory` (Error 1102), and the
     # next request gets a new isolate. At most 1 GiB, which the isolate's cage leaves room for. 0
     # means no limit, as upstream.
+
+    durableObjectStorageBytes @3 :UInt64;
+    # Bytes one Durable Object's SQLite database may hold, for each namespace the Worker declares:
+    # its `max_page_count` is set to this over its page size each time it is opened or reset, so
+    # a write needing a page past it fails with `database or disk is full: SQLITE_FULL` while
+    # reads and deletes succeed. The key-value storage API writes to the same database and is
+    # refused the same way. 0 means unlimited. Cloudflare's figure is 10 GB per object
+    # [https://developers.cloudflare.com/durable-objects/platform/limits/].
   }
 }

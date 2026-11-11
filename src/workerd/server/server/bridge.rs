@@ -171,6 +171,8 @@ pub mod ffi {
         facet_id: KjMaybe<u32>,
         /// The cluster replicates the actor's commits: each waits for `Committer::commit`.
         replicated: bool,
+        /// Bytes the actor's SQLite database may hold (`apsy-storage-cap.h`); 0 for no limit.
+        max_bytes: u64,
     }
 
     /// What an alarm does when another instance owns its object: runs again later, a retry

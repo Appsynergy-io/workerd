@@ -32,10 +32,19 @@ fn actor_configs_of(
     build: impl FnOnce(config::Builder<'_>),
     experimental: bool,
 ) -> (Result<ActorConfigs>, Vec<String>) {
+    actor_configs_with(build, experimental, &Platform::none())
+}
+
+fn actor_configs_with(
+    build: impl FnOnce(config::Builder<'_>),
+    experimental: bool,
+    platform: &Platform,
+) -> (Result<ActorConfigs>, Vec<String>) {
     let message = config_message(build);
     let config = message.get_root::<config::Reader>().unwrap();
     let (report, errors) = collecting_reporter();
-    let result = collect_actor_configs(config, experimental, &report).map_err(capnp_error);
+    let result =
+        collect_actor_configs(config, experimental, platform, &report).map_err(capnp_error);
     let errors = errors.borrow().clone();
     (result, errors)
 }
@@ -74,6 +83,7 @@ fn actor_configs_read_durable_and_ephemeral_namespaces() {
             enable_sql: true,
             workflow: None,
             container: None,
+            max_storage_bytes: 0,
         })
     );
     assert_eq!(
@@ -86,6 +96,49 @@ fn actor_configs_read_durable_and_ephemeral_namespaces() {
     // Config order is kept.
     let names: Vec<&String> = main.keys().collect();
     assert_eq!(names, ["Counter", "Cache"]);
+}
+
+#[test]
+fn a_workers_storage_limit_holds_each_of_its_durable_namespaces() {
+    let platform = Platform::decode(crate::platform::encoded(|p| {
+        let mut service = p.init_services(1).get(0);
+        service.set_name("main");
+        service
+            .init_limits()
+            .set_durable_object_storage_bytes(10_000_000_000);
+    }))
+    .unwrap();
+    let (result, errors) = actor_configs_with(
+        |config| {
+            let mut service = config.init_services(1).get(0);
+            service.set_name("main");
+            let mut worker = service.init_worker();
+            worker
+                .reborrow()
+                .get_durable_object_storage()
+                .set_in_memory(());
+            let mut namespaces = worker.init_durable_object_namespaces(2);
+            let mut first = namespaces.reborrow().get(0);
+            first.set_class_name("A");
+            first.set_unique_key("a-key");
+            let mut second = namespaces.get(1);
+            second.set_class_name("B");
+            second.set_unique_key("b-key");
+        },
+        false,
+        &platform,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let configs = result.unwrap();
+    for class in ["A", "B"] {
+        let Some(ActorConfig::Durable {
+            max_storage_bytes, ..
+        }) = configs["main"].get(class)
+        else {
+            panic!("{class} is not a durable namespace");
+        };
+        assert_eq!(*max_storage_bytes, 10_000_000_000, "{class}");
+    }
 }
 
 #[test]

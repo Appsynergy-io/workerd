@@ -361,6 +361,15 @@ impl ActorNamespace {
         matches!(self.config, ActorConfig::Durable { .. })
     }
 
+    fn max_storage_bytes(&self) -> u64 {
+        match &self.config {
+            ActorConfig::Durable {
+                max_storage_bytes, ..
+            } => *max_storage_bytes,
+            ActorConfig::Ephemeral { .. } => 0,
+        }
+    }
+
     fn enable_sql(&self) -> bool {
         match &self.config {
             ActorConfig::Durable { enable_sql, .. } | ActorConfig::Ephemeral { enable_sql, .. } => {
@@ -1394,6 +1403,7 @@ impl ActorContainer {
             root_key: self.root_key.clone(),
             facet_id: self.facet_id()?.into(),
             replicated: ns.cluster().is_some(),
+            max_bytes: ns.max_storage_bytes(),
         };
         let actor = Rc::new(class.new_actor(NewActor {
             id,

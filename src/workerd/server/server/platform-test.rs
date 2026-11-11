@@ -1,18 +1,6 @@
-use apsy_capnp::platform;
-
 use super::Limits;
 use super::Platform;
-
-/// `build`'s `Platform` as the command line hands it over: an encoded message in words.
-fn encoded(build: impl FnOnce(platform::Builder<'_>)) -> Vec<u64> {
-    let mut message = capnp::message::Builder::new_default();
-    build(message.init_root::<platform::Builder>());
-    let bytes = capnp::serialize::write_message_to_words(&message);
-    bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
-        .collect()
-}
+use super::encoded;
 
 #[test]
 fn a_service_with_limits_has_them_and_one_without_has_none() {
@@ -33,6 +21,7 @@ fn a_service_with_limits_has_them_and_one_without_has_none() {
             cpu_ms: 50,
             subrequests: 1000,
             memory_bytes: 128 << 20,
+            durable_object_storage_bytes: 0,
         })
     );
     assert_eq!(platform.service("plain").unwrap().limits, None);

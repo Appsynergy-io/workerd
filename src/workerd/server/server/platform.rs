@@ -22,6 +22,8 @@ pub struct Limits {
     pub subrequests: u32,
     /// Bytes the isolate may hold; 0 for no memory limit.
     pub memory_bytes: u64,
+    /// Bytes each Durable Object's database may hold; 0 for no limit.
+    pub durable_object_storage_bytes: u64,
 }
 
 /// The most `Limits.memoryBytes` may be: what one isolate's pointer-compression cage leaves room
@@ -80,6 +82,7 @@ impl Platform {
                     cpu_ms: limits.get_cpu_ms(),
                     subrequests: limits.get_subrequests(),
                     memory_bytes: limits.get_memory_bytes(),
+                    durable_object_storage_bytes: limits.get_durable_object_storage_bytes(),
                 })
             } else {
                 None
@@ -129,6 +132,14 @@ impl Platform {
         self.service(name)?.rebuild_group.as_deref()
     }
 
+    /// The bytes each Durable Object of the Worker service `name` may hold; 0 for no limit.
+    #[must_use]
+    pub fn durable_object_storage_bytes(&self, name: &str) -> u64 {
+        self.service(name)
+            .and_then(|service| service.limits)
+            .map_or(0, |limits| limits.durable_object_storage_bytes)
+    }
+
     /// Reports every service the settings name that is not a Worker service of `config`: a typo
     /// would otherwise leave a Worker without the limits the platform meant it to have.
     pub fn check_against(&self, config: config::Reader<'_>, report: &Reporter) -> Result<()> {
@@ -156,6 +167,17 @@ impl Platform {
         }
         Ok(())
     }
+}
+
+/// `build`'s `Platform` as the command line hands it over: an encoded message in words.
+#[cfg(test)]
+pub(crate) fn encoded(build: impl FnOnce(platform::Builder<'_>)) -> Vec<u64> {
+    let mut message = capnp::message::Builder::new_default();
+    build(message.init_root::<platform::Builder>());
+    capnp::serialize::write_message_to_words(&message)
+        .chunks_exact(8)
+        .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect()
 }
 
 #[cfg(test)]

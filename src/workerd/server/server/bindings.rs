@@ -118,6 +118,11 @@ pub enum ActorConfig {
         workflow: Option<Box<Workflow>>,
         /// Where the config has the class's `container` options, if it has any.
         container: Option<crate::bridge::ffi::ContainerRef>,
+        /// Bytes each object's SQLite database may hold, from the platform's settings for the
+        /// declaring worker (apsy.capnp `Limits.durableObjectStorageBytes`); 0 for no limit. A
+        /// Workflow's namespace has none: its storage is the engine's, not the declaring worker's
+        /// objects'.
+        max_storage_bytes: u64,
     },
     Ephemeral {
         evictable: bool,

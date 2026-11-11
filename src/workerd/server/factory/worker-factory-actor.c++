@@ -8,6 +8,7 @@
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/io-context.h>
 #include <workerd/server/actor-id-impl.h>
+#include <workerd/server/factory/apsy-storage-cap.h>
 #include <workerd/server/workerd-api.h>
 
 namespace workerd::server {
@@ -529,7 +530,7 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
     kj::Maybe<kj::String> actorName,
     kj::Maybe<::rust::Box<Committer>> committer) {
   return [storage = kj::mv(storage), durable = spec.durable, facetId = spec.facet_id,
-             rootKey = kj::mv(rootKey), actorName = kj::mv(actorName),
+             maxBytes = spec.max_bytes, rootKey = kj::mv(rootKey), actorName = kj::mv(actorName),
              committer = kj::mv(committer)](const ActorCache::SharedLru& sharedLru,
              OutputGate& outputGate, ActorCache::Hooks& hooks,
              SqliteObserver& sqliteObserver) mutable -> kj::Maybe<kj::Own<ActorCacheInterface>> {
@@ -555,12 +556,15 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
         kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
     // The database runs in WAL mode, also after `reset()` (which `deleteAll()` uses, and which
     // also deletes the child facets' storage; that is not transactional with the reset, as it is
-    // in production).
+    // in production). Its storage limit belongs to the connection, so it is set again after a
+    // reset too (see apsy-storage-cap.h).
     db->run("PRAGMA journal_mode=WAL;");
-    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId](
+    apsy::capDatabaseSize(*db, maxBytes);
+    db->afterReset([storage = kj::addRef(*storage), rootKey = kj::str(rootKey), selfId, maxBytes](
                        SqliteDatabase& db) mutable {
       storage->actors->database_reset(toRust(storage->getSqlitePath(rootKey, selfId).toString()));
       db.run("PRAGMA journal_mode=WAL;");
+      apsy::capDatabaseSize(db, maxBytes);
       storage->deleteDescendantStorage(*KJ_ASSERT_NONNULL(storage->directory), rootKey, selfId);
     });
     kj::Function<kj::Promise<void>(SpanParent)> commit = [](SpanParent) -> kj::Promise<void> {
