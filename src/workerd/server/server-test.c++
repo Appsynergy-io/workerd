@@ -881,6 +881,40 @@ kj::String singleWorker(kj::StringPtr def) {
   ))"_kj);
 }
 
+// AppSynergy: "Date.now returns the time of the last I/O. It does not
+// advance during code execution", and performance.now() with it (factory WorkerTimerChannel).
+// Both read dateNow(): performance.now() directly, Date.now() through the V8 platform the binary
+// installs (WorkerdPlatform::CurrentClockTimeMillis()). This test process runs V8's default
+// platform, whose Date.now() reads the system clock, so the test reads performance.now().
+KJ_TEST("Server: performance.now(), and so Date.now(), does not advance during code execution") {
+  TestServer test(R"((
+    services = [(
+      name = "worker",
+      worker = (
+        compatibilityDate = "2024-01-01",
+        modules = [(
+          name = "worker.js",
+          esModule =
+            `export default {
+            `  async fetch(request) {
+            `    const before = performance.now();
+            `    let x = 0;
+            `    for (let i = 0; i < 30000000; i++) x += i;
+            `    const after = performance.now();
+            `    return new Response(after === before ? "frozen" : "advanced " + (after - before) + " " + x);
+            `  }
+            `}
+        )]
+      )
+    )],
+    sockets = [(name = "main", address = "test-addr", service = "worker")]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "frozen");
+}
+
 KJ_TEST("Server: TCP listener survives connect() handler exceptions") {
   TestServer test(R"((
     services = [(

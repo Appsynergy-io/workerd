@@ -154,8 +154,9 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   void taskFailed(kj::Exception&& exception) override;
 };
 
-// The clock JavaScript sees: the calendar clock for `now()`, timers measured from a fresh
-// monotonic reading so that time spent in JavaScript since the last poll does not shorten them.
+// The clock JavaScript sees: the time of the last I/O for `now()`, timers measured from a fresh
+// monotonic reading so that time spent in JavaScript since the last poll does not shorten them
+// (from the frozen `now()`, a timer may fire late, never early).
 class WorkerTimerChannel final: public TimerChannel {
  public:
   WorkerTimerChannel(kj::Timer& timer, const kj::MonotonicClock& monotonicClock)
@@ -164,6 +165,16 @@ class WorkerTimerChannel final: public TimerChannel {
 
   void syncTime() override {}
   kj::Date now(kj::Maybe<kj::Date>) override {
+    // AppSynergy: "Date.now returns the time of the last
+    // I/O. It does not advance during code execution", and performance.now() (dateNow()) with
+    // it. JavaScript is entered afresh after every I/O (IoContext::run() opens an enterJs()
+    // scope), and that entry's instant holds until the scope exits, so a synchronous loop sees
+    // the same instant at its start and its end. The event loop's timer is no stand-in: it reads
+    // the live clock while the loop is parked, which is where the Rust server's tasks run
+    // (kj-rs-tokio TokioEventPort). Outside JavaScript the calendar is read as upstream reads it.
+    KJ_IF_SOME(entered, jsEntryTime()) {
+      return entered;
+    }
     return kj::systemPreciseCalendarClock().now();
   }
   kj::Promise<void> atTime(kj::Date when) override {

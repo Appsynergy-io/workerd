@@ -92,6 +92,11 @@ static kj::Exception limitExceededException(EventOutcome outcome) {
   return e;
 }
 
+// The instant the outermost JsScope on this thread was entered at, and how deep JsScopes are
+// nested on it (see jsEntryTime()).
+thread_local kj::Maybe<kj::Date> jsEntryInstant;
+thread_local uint jsScopeDepth = 0;
+
 // A clock that cannot be read counts as over its limit (see apsy-limits.h).
 using apsy::cpuDeadlineFrom;
 using apsy::cpuDeadlineReached;
@@ -890,6 +895,7 @@ class MeasuringLimitEnforcer final: public LimitEnforcer, private MemoryLimitedC
         kj::Maybe<const LimitedIsolateLimitEnforcer&> isolateEnforcer)
         : enforcer(enforcer),
           isolateEnforcer(isolateEnforcer) {
+      if (jsScopeDepth++ == 0) jsEntryInstant = kj::systemPreciseCalendarClock().now();
       entry.clockReadable = pthread_getcpuclockid(pthread_self(), &entry.clock) == 0;
       entry.isolate = isolate;
       startNanos = readClockNanos(CLOCK_THREAD_CPUTIME_ID);
@@ -924,6 +930,7 @@ class MeasuringLimitEnforcer final: public LimitEnforcer, private MemoryLimitedC
     }
 
     ~JsScope() noexcept(false) {
+      KJ_DEFER(if (--jsScopeDepth == 0) jsEntryInstant = kj::none);
       // First, so a full collection it asks for is charged to this invocation's CPU time.
       bool memoryHit = false;
       KJ_IF_SOME(e, isolateEnforcer) {
@@ -1021,6 +1028,10 @@ kj::Maybe<const LimitedIsolateLimitEnforcer&> limitedEnforcerOf(const Worker& wo
 }
 
 }  // namespace
+
+kj::Maybe<kj::Date> jsEntryTime() {
+  return jsEntryInstant;
+}
 
 kj::Maybe<WorkerLimits> workerLimits(
     kj::Maybe<apsy::Platform::Reader> platform, kj::StringPtr service) {

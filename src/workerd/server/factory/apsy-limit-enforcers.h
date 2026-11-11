@@ -35,6 +35,12 @@ struct WorkerLimits {
 kj::Maybe<WorkerLimits> workerLimits(
     kj::Maybe<apsy::Platform::Reader> platform, kj::StringPtr service);
 
+// The instant the JavaScript running on this thread was entered at: read once when an invocation
+// enters JavaScript (an IoContext's enterJs(), which is every resumption after I/O) and kept until
+// that outermost scope exits. None outside JavaScript. The time Date.now() reports
+// (WorkerTimerChannel in worker-factory-impl.h).
+kj::Maybe<kj::Date> jsEntryTime();
+
 // What a request observer that records CPU time implements: MeasuringLimitEnforcer reports each
 // invocation's CPU time to it (see RequestObserverWithTracer in worker-factory.c++).
 class CpuTimeObserver {
