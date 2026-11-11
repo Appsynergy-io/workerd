@@ -5,6 +5,7 @@
 //! `workerd serve`, `workerd test` and `workerd bench`: bind the sockets, build the service
 //! graph, listen, and either wait for the drain signal or run the tests or benchmarks.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
@@ -48,6 +49,7 @@ use crate::listen::ListenContext;
 use crate::listen::StreamListener;
 use crate::listen::TcpTls;
 use crate::log;
+use crate::platform::Platform;
 use crate::services::network::tls_options;
 use crate::services::rewriter::HttpRewriter;
 
@@ -63,7 +65,7 @@ pub struct RunOptions {
     pub socket_fds: HashMap<String, socket2::Socket>,
     /// `--inspector-addr`.
     pub inspector: Option<String>,
-    /// `--control-fd`: where the `listen` events go, one JSON object per line.
+    /// `--control-fd`: where the `listen` and `service-error` events go, one JSON object per line.
     pub control: Option<std::fs::File>,
     /// `--debug-port`.
     pub debug_port: Option<String>,
@@ -73,36 +75,39 @@ pub struct RunOptions {
     /// The source deployment of each appended service and of each service left absent because its
     /// deployment was skipped.
     pub deployments: Deployments,
+    /// `--platform-config` or `--platform-config-fd`: the platform's settings (apsy.capnp
+    /// `Platform`) as an encoded message; none to run every Worker as upstream workerd does.
+    pub platform: Option<Vec<u64>>,
 }
 
 /// The control channel (`--control-fd`), written line by line; a failed write is logged. The
 /// events are formatted by hand to keep their fields in a fixed order, `port` last: consumers
 /// include shell scripts that cut the port off the end of the line.
-struct Control(Option<std::fs::File>);
+pub(crate) struct Control(RefCell<Option<std::fs::File>>);
 
 impl Control {
-    fn write(&mut self, line: &str) {
-        if let Some(file) = &mut self.0
+    fn write(&self, line: &str) {
+        if let Some(file) = &mut *self.0.borrow_mut()
             && let Err(e) = file.write_all(line.as_bytes())
         {
             tracing::error!("--control-fd: {e}");
         }
     }
 
-    fn listen(&mut self, socket: &str, port: u16) {
+    fn listen(&self, socket: &str, port: u16) {
         let socket = serde_json::Value::from(socket);
         self.write(&format!(
             "{{\"event\":\"listen\",\"socket\":{socket},\"port\":{port}}}\n"
         ));
     }
 
-    fn listen_inspector(&mut self, port: u16) {
+    fn listen_inspector(&self, port: u16) {
         self.write(&format!(
             "{{\"event\":\"listen-inspector\",\"port\":{port}}}\n"
         ));
     }
 
-    fn listen_cluster(&mut self, listener: &tokio::net::TcpListener) -> Result<()> {
+    fn listen_cluster(&self, listener: &tokio::net::TcpListener) -> Result<()> {
         let port = listener
             .local_addr()
             .map_err(|e| kj::failed!("{e}"))?
@@ -111,6 +116,16 @@ impl Control {
             "{{\"event\":\"listen-cluster\",\"port\":{port}}}\n"
         ));
         Ok(())
+    }
+
+    /// A service's config error, a startup exception among them: a stream no Worker's console
+    /// output reaches, in the shape of the `listen` events.
+    fn service_error(&self, service: &str, error: &str) {
+        let service = serde_json::Value::from(service);
+        let error = serde_json::Value::from(error);
+        self.write(&format!(
+            "{{\"event\":\"service-error\",\"service\":{service},\"error\":{error}}}\n"
+        ));
     }
 }
 
@@ -135,7 +150,20 @@ async fn start(
 ) -> Result<Option<Running>> {
     let message = factory.config()?;
     let config = message.get_root::<config::Reader>().map_err(capnp_error)?;
-    let mut control = Control(options.control.take());
+    let control = Rc::new(Control(RefCell::new(options.control.take())));
+    if control.0.borrow().is_some() {
+        let errors = Rc::clone(&control);
+        report.forward_service_errors(Box::new(move |service, error| {
+            errors.service_error(service, error);
+        }));
+    }
+    // The platform's settings, before any worker is compiled: its limits are the isolate's.
+    let platform = match options.platform.take() {
+        Some(words) => Platform::decode(words)?,
+        None => Platform::none(),
+    };
+    platform.check_against(config, &report)?;
+    factory.set_platform(platform)?;
 
     let bound = listen::bind_sockets(
         config,

@@ -57,6 +57,7 @@ use crate::channels::WorkerInterface;
 use crate::cluster::ClusterNode;
 use crate::listen::loopback::Loopback;
 use crate::loader::WorkerLoaderNamespace;
+use crate::platform::Platform;
 use crate::services::DiskDirectoryService;
 use crate::worker::LinkedChannels;
 use crate::worker::WorkerService;
@@ -65,6 +66,8 @@ use crate::worker::WorkerService;
 pub struct Factory {
     inner: KjOwn<ffi::WorkerFactory>,
     loopback: Loopback,
+    /// The platform's settings for the current run (`--platform-config`, platform.rs).
+    platform: RefCell<Rc<Platform>>,
 }
 
 impl Factory {
@@ -73,7 +76,23 @@ impl Factory {
         Self {
             inner,
             loopback: Loopback::default(),
+            platform: RefCell::new(Rc::new(Platform::none())),
         }
+    }
+
+    /// The platform's settings for the current run; [`Platform::none`] without
+    /// `--platform-config`.
+    #[must_use]
+    pub fn platform(&self) -> Rc<Platform> {
+        Rc::clone(&self.platform.borrow())
+    }
+
+    /// Sets the platform's settings for the run about to start, here and in the C++ factory,
+    /// before any worker is compiled.
+    pub fn set_platform(&self, platform: Platform) -> Result<()> {
+        ffi::factory_set_platform(&self.inner, platform.words())?;
+        *self.platform.borrow_mut() = Rc::new(platform);
+        Ok(())
     }
 
     /// The `loopback:` namespace of this server's sockets and external services.
@@ -170,6 +189,9 @@ pub struct Reporter {
     broken: RefCell<BTreeMap<String, BTreeSet<String>>>,
     /// The services the node's own config defines (`set_node_services`).
     node_services: RefCell<HashSet<String>>,
+    /// Where each service error also goes, as the service's name and the error
+    /// (`forward_service_errors`).
+    service_errors: RefCell<Option<Box<dyn Fn(&str, &str)>>>,
 }
 
 /// Tracks which services came from cluster deployments.
@@ -209,7 +231,14 @@ impl Reporter {
             deployment_warning: None,
             broken: RefCell::new(BTreeMap::new()),
             node_services: RefCell::default(),
+            service_errors: RefCell::new(None),
         }
+    }
+
+    /// Sends every later service error to `sink` too, as the service's name and the error
+    /// unescaped: `--control-fd`'s `service-error` event (run.rs `Control`).
+    pub fn forward_service_errors(&self, sink: Box<dyn Fn(&str, &str)>) {
+        *self.service_errors.borrow_mut() = Some(sink);
     }
 
     /// Enables deployment attribution for `workerd serve`.
@@ -279,14 +308,28 @@ impl Reporter {
     }
 
     /// Reports an error as `service <name>: <message>` through [`error_in`](Self::error_in).
+    ///
+    /// The message can carry a Worker's own words (an exception its startup threw), so a line
+    /// break in it is written escaped: one report is one line, and no text a Worker chooses starts
+    /// a line of its own naming another service.
     pub fn service_error(&self, service: &str, message: impl AsRef<str>) {
-        self.error_in(service, format!("service {service}: {}", message.as_ref()));
+        let message = message.as_ref();
+        if let Some(sink) = &*self.service_errors.borrow() {
+            sink(service, message);
+        }
+        self.error_in(
+            service,
+            format!("service {service}: {}", escape_line_breaks(message)),
+        );
     }
 
     /// Reports a warning as `service <name>: <message>`, attributed to `service`'s deployment if
     /// it came from one.
     pub fn service_warning(&self, service: &str, message: impl AsRef<str>) {
-        let message = format!("service {service}: {}", message.as_ref());
+        let message = format!(
+            "service {service}: {}",
+            escape_line_breaks(message.as_ref())
+        );
         match (
             self.deployments.services.get(service),
             &self.deployment_warning,
@@ -342,9 +385,14 @@ impl Reporter {
         }
     }
 
-    /// Reports a service reference error as `service <name>: <message>`.
+    /// Reports a service reference error as `service <name>: <message>`, escaped and forwarded
+    /// as [`service_error`](Self::service_error) does.
     pub fn service_reference_error(&self, service: &str, target: &str, message: impl AsRef<str>) {
-        let message = format!("service {service}: {}", message.as_ref());
+        let message = message.as_ref();
+        if let Some(sink) = &*self.service_errors.borrow() {
+            sink(service, message);
+        }
+        let message = format!("service {service}: {}", escape_line_breaks(message));
         self.reference_error(Some(service), target, message);
     }
 
@@ -398,6 +446,11 @@ impl Reporter {
             None => self.error(message),
         }
     }
+}
+
+/// `text` with each line break written as a backslash and a letter.
+fn escape_line_breaks(text: &str) -> String {
+    text.replace('\n', "\\n").replace('\r', "\\r")
 }
 
 /// The CLI's substitutions for config values, by service or socket name.

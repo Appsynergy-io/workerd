@@ -6,6 +6,7 @@
 
 // The private state behind worker-factory.h, shared by the factory's source files.
 
+#include "apsy-limit-enforcers.h"
 #include "worker-factory.h"
 
 #include <workerd/io/actor-sqlite.h>
@@ -100,6 +101,21 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   capnp::FlatArrayMessageReader configReader;
   config::Config::Reader config;
 
+  // AppSynergy: the platform's settings for the current run (`--platform-config`,
+  // factory_set_platform()); none without them. The reader borrows the words.
+  struct PlatformMessage {
+    kj::Array<capnp::word> words;
+    capnp::FlatArrayMessageReader reader;
+    explicit PlatformMessage(kj::Array<capnp::word> wordsParam)
+        : words(kj::mv(wordsParam)),
+          reader(words) {}
+  };
+  kj::Maybe<kj::Own<PlatformMessage>> platform;
+  kj::Maybe<apsy::Platform::Reader> getPlatform() {
+    return platform.map(
+        [](kj::Own<PlatformMessage>& m) { return m->reader.getRoot<apsy::Platform>(); });
+  }
+
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
   capnp::HttpOverCapnpFactory httpOverCapnpFactory;
@@ -191,6 +207,23 @@ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::Er
   kj::Vector<kj::Rc<IoChannelFactory::RpcChannel>> rpcChannels;
   kj::Maybe<kj::String> accessBlobHeader;
   bool isDynamic = false;
+
+  // A config worker's index among the config's services, its `env` (an encoded `Globals`
+  // message), its inbound listeners and its `ctx.exports` (`worker_set_ctx_exports()`), from which
+  // worker_rebuild() builds it again; none for a dynamic worker.
+  kj::Maybe<uint32_t> configService;
+  kj::Array<uint64_t> globals;
+  kj::Array<InboundListener> inboundListeners;
+  kj::Array<uint64_t> ctxExportsGlobals;
+  // The Worker's limits from the platform's settings (apsy-limit-enforcers.h `workerLimits()`),
+  // applied to every invocation; none for a Worker they give none.
+  kj::Maybe<WorkerLimits> limits;
+  // Whether worker_rebuild() can build the Worker again: a config worker with `limits` on the
+  // legacy module registry, not Python, with no module fallback service and no inspector, whose
+  // construction is self-contained.
+  bool rebuildable = false;
+  // The Workers worker_rebuild() replaced whose isolates still live.
+  CondemnedGenerations condemnedGenerations;
 
   kj::Maybe<kj::Own<const Worker>> worker;
   // Held from compilation until `worker_set_ctx_exports()` fills the object in; none for a worker

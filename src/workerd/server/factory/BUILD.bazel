@@ -1,3 +1,4 @@
+load("//:build/kj_test.bzl", "kj_test")
 load("//:build/linking.bzl", "CC_LIBRARY_LINKSTATIC")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
@@ -27,6 +28,8 @@ wd_cc_library(
 wd_cc_library(
     name = "worker-factory",
     srcs = [
+        "apsy-limit-enforcers.c++",
+        "apsy-limit-enforcers.h",
         "worker-factory.c++",
         "worker-factory-actor.c++",
         "worker-factory-impl.h",
@@ -35,6 +38,7 @@ wd_cc_library(
     ],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
+        ":apsy-limits",
         ":worker-factory-hdrs",
         "//src/rust/worker:bridge",
         "//src/workerd/api:memory-cache",
@@ -45,6 +49,7 @@ wd_cc_library(
         "//src/workerd/jsg",
         "//src/workerd/server:actor-id-impl",
         "//src/workerd/server:alarm-scheduler",
+        "//src/workerd/server:apsy_capnp",
         "//src/workerd/server:channel-token",
         "//src/workerd/server:compiled-bindings_capnp",
         "//src/workerd/server:container-client",
@@ -64,6 +69,19 @@ wd_cc_library(
         "@capnp-cpp//src/kj/compat:kj-http",
         "@ssl",
     ],
+)
+
+# The decisions the factory's CPU and memory limits rest on (apsy-limit-enforcers.c++), apart from
+# the isolate, so each is tested alone.
+wd_cc_library(
+    name = "apsy-limits",
+    hdrs = ["apsy-limits.h"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+kj_test(
+    src = "apsy-limits-test.c++",
+    deps = [":apsy-limits"],
 )
 
 # The declarations both bridges (the command line's and the server's) need from :bootstrap.

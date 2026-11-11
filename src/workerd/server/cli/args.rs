@@ -401,6 +401,18 @@ pub struct ServeArgs {
     #[arg(long, value_name = "fd", value_parser = parse_control_fd)]
     pub control_fd: Option<u32>,
 
+    /// Read the platform's settings from <file>: one `Platform` struct literal of AppSynergy's
+    /// apsy.capnp in Cap'n Proto's text format, at most 4 MiB. Without it, or
+    /// --platform-config-fd, none of those settings applies. Given at most once.
+    #[arg(long, value_name = "file")]
+    pub platform_config: Vec<String>,
+
+    /// Read the platform's settings, as --platform-config does, from descriptor <fd> to its end,
+    /// then close it. Given at most once, not with --platform-config, and not with --watch, whose
+    /// restart could not read them again.
+    #[arg(long, value_name = "fd", value_parser = parse_control_fd)]
+    pub platform_config_fd: Vec<u32>,
+
     /// Bind the cluster's peer port to <addr> instead of the config's `cluster.address`. The
     /// port gives full access to every service in the process to holders of the cluster key, and
     /// its traffic is not encrypted: only the cluster's instances should reach it, on a private

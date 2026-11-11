@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+#include "apsy-limit-enforcers.h"
 #include "worker-factory-impl.h"
 
 #include <workerd/api/analytics-engine.capnp.h>
@@ -260,6 +261,15 @@ bool factory_tail_workers(const WorkerFactory& factory) {
   return factory.getImpl().options->tailWorkers;
 }
 
+void factory_set_platform(const WorkerFactory& factory, ::rust::Slice<const uint64_t> platform) {
+  auto& impl = factory.getImpl();
+  impl.platform = kj::none;
+  if (platform.empty()) return;
+  auto words = kj::heapArray<capnp::word>(platform.size());
+  memcpy(words.begin(), platform.data(), platform.size() * sizeof(uint64_t));
+  impl.platform = kj::heap<WorkerFactory::Impl::PlatformMessage>(kj::mv(words));
+}
+
 Worker::Actor::Id normalizeActorId(Worker::Actor::Id id) {
   KJ_IF_SOME(doId, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
     KJ_IF_SOME(name, doId->getName()) {
@@ -272,7 +282,8 @@ Worker::Actor::Id normalizeActorId(Worker::Actor::Id id) {
 }
 
 // =======================================================================================
-// Single-tenant policy: no limits, and tracing that feeds tail workers directly.
+// Single-tenant policy: tracing that feeds tail workers directly. A Worker the platform's settings
+// give `limits` runs under the limits of apsy-limit-enforcers.h; any other has none, as upstream.
 
 namespace {
 
@@ -368,46 +379,13 @@ kj::Own<IsolateObserver> newIsolateObserver(const WorkerFactory::Options& option
   return kj::atomicRefcounted<IsolateObserver>();
 }
 
-class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
- public:
-  kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
-    return {};
-  }
-  void topUpActor() override {}
-  void newSubrequest(bool isInHouse) override {}
-  void newKvRequest(KvOpType op) override {}
-  void newAnalyticsEngineRequest() override {}
-  kj::Promise<void> limitDrain() override {
-    return kj::NEVER_DONE;
-  }
-  kj::Promise<void> limitScheduled() override {
-    return kj::NEVER_DONE;
-  }
-  kj::Duration getAlarmLimit() override {
-    return 15 * kj::MINUTES;
-  }
-  size_t getBufferingLimit() override {
-    return kj::maxValue;
-  }
-  kj::Maybe<EventOutcome> getLimitsExceeded() override {
-    return kj::none;
-  }
-  kj::Promise<void> onLimitsExceeded() override {
-    return kj::NEVER_DONE;
-  }
-  void setCpuLimitNearlyExceededCallback(kj::Function<void()> cb) override {}
-  void requireLimitsNotExceeded() override {}
-  void reportMetrics(RequestObserver& requestMetrics) override {}
-  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
-    return 0 * kj::SECONDS;
-  }
-  size_t getSqliteMemoryUsage() const override {
-    return 0;
-  }
-};
-
-// Records a request's outcome on its tracer, wrapping the WorkerInterface to observe failures.
-class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
+// Records a request's outcome on its tracer, wrapping the WorkerInterface to observe failures,
+// with the invocation's CPU time (which its MeasuringLimitEnforcer reports, apsy-limit-enforcers.h)
+// and wall time. The trace's scriptName is left null: workerd knows only the config's
+// service name, which is not the Worker's script name.
+class RequestObserverWithTracer final: public RequestObserver,
+                                       public WorkerInterface,
+                                       public CpuTimeObserver {
  public:
   explicit RequestObserverWithTracer(kj::Maybe<kj::Rc<WorkerTracer>> tracer)
       : tracer(kj::mv(tracer)) {}
@@ -417,8 +395,29 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
       KJ_IF_SOME(ioContext, IoContext::tryCurrent()) {
         t->recordTimestamp(ioContext.now());
       }
-      t->setOutcome(outcome, 0 * kj::MILLISECONDS, 0 * kj::MILLISECONDS);
+      if (wallTime == 0 * kj::NANOSECONDS) {
+        KJ_IF_SOME(start, deliveredAt) {
+          wallTime = kj::systemPreciseMonotonicClock().now() - start;
+        }
+      }
+      t->setOutcome(outcome, cpuTime, wallTime);
     }
+  }
+
+  // The invocation starts when it is delivered and ends when no more JavaScript will run on its
+  // behalf, waitUntil() tasks included.
+  void delivered() override {
+    deliveredAt = kj::systemPreciseMonotonicClock().now();
+  }
+
+  void jsDone() override {
+    KJ_IF_SOME(start, deliveredAt) {
+      wallTime = kj::systemPreciseMonotonicClock().now() - start;
+    }
+  }
+
+  void addCpuTime(kj::Duration time) override {
+    cpuTime += time;
   }
 
   WorkerInterface& wrapWorkerInterface(WorkerInterface& worker) override {
@@ -489,6 +488,9 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
   kj::Maybe<kj::Rc<WorkerTracer>> tracer;
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
+  kj::Maybe<kj::TimePoint> deliveredAt;
+  kj::Duration cpuTime = 0 * kj::NANOSECONDS;
+  kj::Duration wallTime = 0 * kj::NANOSECONDS;
 
   // Reports the promise's failure, if any, before propagating it.
   template <typename T>
@@ -1144,13 +1146,20 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
     }
   }
 
+  // A Durable Object's event runs in the Worker the object was constructed in, which a rebuild
+  // (worker_rebuild()) leaves running until the object goes; any other request in the current one.
+  const Worker& entryWorker = [&]() -> const Worker& {
+    KJ_IF_SOME(a, actor) return a->getWorker();
+    return worker.getWorker();
+  }();
+  bool isActor = actor != kj::none;
   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
-  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
-      kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
-      kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
-      kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
-      kj::mv(metadata.clientAddress));
+  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(entryWorker), entrypointName.clone(),
+      kj::mv(props), kj::mv(actor), newMeasuringLimitEnforcer(worker.limits, isActor, entryWorker),
+      {}, kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true,
+      kj::mv(workerTracer), kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext),
+      IsDynamicDispatch::NO, kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory),
+      metadata.fromPersistentStub, kj::mv(metadata.clientAddress));
 }
 
 }  // namespace
@@ -1574,6 +1583,53 @@ bool supportsStartupSnapshot(CompatibilityFlags::Reader featureFlags, const Work
       !source.variant.is<WorkerSource::ScriptSource>() && !hasWasmModules(source);
 }
 
+// The isolate of a Worker, or of the zygote that snapshots its startup. A Worker with `limits` is
+// held to the limits of apsy-limit-enforcers.h, in an isolate group of its own; any other
+// Worker's isolate has none, as upstream's.
+kj::Own<Worker::Isolate> newWorkerIsolate(WorkerFactory::Impl& factory,
+    CompatibilityFlags::Reader featureFlags,
+    capnp::List<config::Extension>::Reader extensions,
+    kj::ArrayPtr<const InboundListener> inboundListeners,
+    kj::StringPtr isolateName,
+    Worker::Isolate::InspectorPolicy policy,
+    kj::Maybe<jsg::SnapshotConfig> snapshotConfig,
+    Worker::ConsoleMode consoleMode,
+    kj::Maybe<const WorkerLimits&> limits) {
+  auto& options = *factory.options;
+  // A memory limit takes an isolate group, and so a pointer-compression cage, of its own.
+  bool ownCage =
+      limits.map([](const WorkerLimits& l) { return l.memoryBytes > 0; }).orDefault(false);
+  kj::Own<IsolateLimitEnforcer> limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  KJ_IF_SOME(l, limits) {
+    limitEnforcer = newLimitedIsolateLimitEnforcer(l);
+  }
+  auto listeners = KJ_MAP(listener, inboundListeners) {
+    return Worker::Api::InboundListener{
+      .protocol = kj::str(listener.protocol),
+      .address = kj::str(listener.address),
+      .port = listener.port,
+    };
+  };
+  auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
+      limitEnforcer->getCreateParams(), ownCage ? newWorkerIsolateGroup() : jsg::newIsolateGroup(),
+      kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
+      options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
+  Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;
+  isolateLoggingOptions.consoleMode = consoleMode;
+  return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), newIsolateObserver(options),
+      isolateName, kj::mv(limitEnforcer), policy, kj::mv(isolateLoggingOptions));
+}
+
+// A Worker whose startup went past a limit, with the termination absorbed at a microtask checkpoint
+// so that its constructor returned, fails to build with that limit's error like one whose startup
+// threw (see takeAbsorbedStartupFailure()).
+void reportAbsorbedStartupFailure(const Worker& worker, ErrorReporter& errorReporter) {
+  KJ_IF_SOME(failure, takeAbsorbedStartupFailure(worker)) {
+    errorReporter.addError(
+        kj::str(jsg::extractTunneledExceptionDescription(failure.getDescription())));
+  }
+}
+
 }  // namespace
 
 kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& constFactory,
@@ -1602,7 +1658,12 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
     featureFlags = compileFlags(options, conf, *impl->flagsArena, errorReporter);
     source = WorkerdApi::extractSource(impl->name, conf, featureFlags, errorReporter);
     if (conf.hasModuleFallback()) moduleFallback = conf.getModuleFallback();
-    compileBindings = [globals = kj::heapArray(kj::from<Rust>(spec.globals))](
+    impl->configService = index;
+    impl->limits = workerLimits(factory.getPlatform(), impl->name);
+    impl->globals = kj::heapArray(kj::from<Rust>(spec.globals));
+    impl->inboundListeners = kj::heapArray<InboundListener>(
+        kj::arrayPtr(spec.inbound_listeners.data(), spec.inbound_listeners.size()));
+    compileBindings = [&globals = impl->globals](
                           jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target) {
       compileGlobals(lock, api, globals, target);
     };
@@ -1661,27 +1722,15 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   }
 
   // The isolate of the Worker, or of the zygote that snapshots its startup.
+  auto consoleMode =
+      workerSource.variant.is<WorkerSource::ScriptSource>() && !usingNewModuleRegistry
+      ? Worker::ConsoleMode::INSPECTOR_ONLY
+      : options.loggingOptions.consoleMode;
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
-    auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
-      return Worker::Api::InboundListener{
-        .protocol = kj::str(listener.protocol),
-        .address = kj::str(listener.address),
-        .port = listener.port,
-      };
-    };
-    auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
-        limitEnforcer->getCreateParams(), jsg::newIsolateGroup(),
-        kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
-        options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
-    Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;
-    isolateLoggingOptions.consoleMode =
-        workerSource.variant.is<WorkerSource::ScriptSource>() && !usingNewModuleRegistry
-        ? Worker::ConsoleMode::INSPECTOR_ONLY
-        : options.loggingOptions.consoleMode;
-    return kj::atomicRefcounted<Worker::Isolate>(kj::mv(api), newIsolateObserver(options),
-        isolateName, kj::mv(limitEnforcer), policy, kj::mv(isolateLoggingOptions));
+    return newWorkerIsolate(factory, featureFlags, extensions,
+        kj::arrayPtr(spec.inbound_listeners.data(), spec.inbound_listeners.size()), isolateName,
+        policy, kj::mv(snapshotConfig), consoleMode, impl->limits);
   };
 
   // Behind the STARTUP_SNAPSHOT autogate, a throwaway zygote Worker evaluates the top-level code
@@ -1786,9 +1835,21 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   },
       IsolateObserver::StartType::COLD, SpanParent(nullptr),
       Worker::Lock::TakeSynchronously(kj::none), errorReporter);
+  reportAbsorbedStartupFailure(*worker, errorReporter);
 
   worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none),
       [&](Worker::Lock& lock) { lock.validateHandlers(errorReporter); });
+
+  // A Worker with `limits` gets a new isolate once its current one is condemned for exceeding its
+  // memory limit. Rebuilding repeats the construction above, so it is offered only where that
+  // construction is self-contained.
+  bool isPython = false;
+  KJ_IF_SOME(modules, workerSource.variant.tryGet<WorkerSource::ModulesSource>()) {
+    isPython = modules.isPython;
+  }
+  impl->rebuildable = impl->limits != kj::none && !usingNewModuleRegistry && !isPython &&
+      moduleFallback == kj::none && registrar == kj::none;
+  if (impl->rebuildable) setReplaceable(*worker);
 
   impl->info = WorkerInfo{
     .entrypoints = ErrorReporter::toRust(errorReporter.entrypoints),
@@ -1824,6 +1885,67 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
     // The handle is dropped now, under the lock.
     impl.ctxExportsHandle = kj::none;
   });
+  // A rebuild fills in the next Worker's `ctx.exports` from the same message.
+  impl.ctxExportsGlobals = kj::heapArray(kj::from<Rust>(globals));
+}
+
+void worker_rebuild(const CompiledWorker& worker) {
+  auto& impl = worker.getImpl();
+  TRACE_EVENT("workerd", "worker_rebuild()", "name", impl.name.cStr());
+  KJ_REQUIRE(impl.rebuildable, "this Worker cannot be built again");
+  auto& factory = impl.factory.getImpl();
+  auto conf = factory.config.getServices()[KJ_ASSERT_NONNULL(impl.configService)].getWorker();
+  ErrorReporter errorReporter;
+  auto featureFlags = impl.flagsArena->getRoot<CompatibilityFlags>().asReader();
+  auto source = WorkerdApi::extractSource(impl.name, conf, featureFlags, errorReporter);
+  auto consoleMode = source.variant.is<WorkerSource::ScriptSource>()
+      ? Worker::ConsoleMode::INSPECTOR_ONLY
+      : factory.options->loggingOptions.consoleMode;
+  auto isolate = newWorkerIsolate(factory, featureFlags, factory.config.getExtensions(),
+      impl.inboundListeners, impl.name, Worker::Isolate::InspectorPolicy::DISALLOW, kj::none,
+      consoleMode, impl.limits);
+  auto script = isolate->newScript(impl.name, source, IsolateObserver::StartType::COLD,
+      SpanParent(nullptr), newWorkerFileSystem(kj::heap<FsMap>(), getBundleDirectory(source)),
+      errorReporter, api::pyodide::ArtifactBundler::makeDisabledBundler());
+  kj::Maybe<jsg::V8Ref<v8::Object>> ctxExportsHandle;
+  auto next = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
+      [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target,
+          v8::Local<v8::Object> ctxExports) {
+    ctxExportsHandle = lock.v8Ref(ctxExports);
+    compileGlobals(lock, api, impl.globals, target);
+  },
+      IsolateObserver::StartType::COLD, SpanParent(nullptr),
+      Worker::Lock::TakeSynchronously(kj::none), errorReporter);
+  reportAbsorbedStartupFailure(*next, errorReporter);
+  // The same validation and `ctx.exports` as the first build, so the loopback channels the server
+  // numbered then are the same.
+  next->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
+    lock.validateHandlers(errorReporter);
+    KJ_IF_SOME(handle, ctxExportsHandle) {
+      JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
+        compileGlobals(
+            lock, next->getIsolate().getApi(), impl.ctxExportsGlobals, handle.getHandle(js));
+      });
+    }
+    ctxExportsHandle = kj::none;
+  });
+  if (!errorReporter.errors.empty()) {
+    KJ_FAIL_REQUIRE(kj::strArray(errorReporter.errors, "\n"));
+  }
+  // A Worker whose startup alone leaves its isolate condemned is a failure like any other: its
+  // requests would each build another.
+  setReplaceable(*next);
+  if (isCondemned(*next)) kj::throwFatalException(memoryLimitExceeded());
+  impl.condemnedGenerations.retire(impl.getWorker());
+  impl.worker = kj::mv(next);
+}
+
+bool worker_condemned(const CompiledWorker& worker) {
+  return isCondemned(worker.getImpl().getWorker());
+}
+
+bool worker_rebuildable(const CompiledWorker& worker) {
+  return worker.getImpl().rebuildable;
 }
 
 void worker_unlink(const CompiledWorker& worker) {

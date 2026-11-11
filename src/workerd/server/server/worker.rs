@@ -17,6 +17,8 @@ use std::ptr;
 use std::rc::Rc;
 use std::rc::Weak;
 
+use ::worker::Interface as _;
+use ::worker::PromisedInterface;
 use futures::future::LocalBoxFuture;
 use hashlink::LinkedHashMap;
 use kj_rs::KjMaybe;
@@ -65,6 +67,7 @@ use crate::config::invalid_config_error;
 use crate::config::text;
 use crate::loader::WorkerLoaderNamespace;
 use crate::loader::dynamic_transfer_error;
+use crate::rebuild::Rebuild;
 
 /// What the link stage resolves for a worker: every designator its config names, and the loopback
 /// channels `ctx.exports` was numbered with.
@@ -140,6 +143,8 @@ pub struct WorkerService {
     /// Whether this worker rejects every request and actor construction because of config errors
     /// attributed to its deployment.
     broken: Cell<bool>,
+    /// When the worker is built again after its isolate went over its memory limit.
+    rebuild: Rebuild,
 }
 
 impl WorkerService {
@@ -226,6 +231,7 @@ impl WorkerService {
         ffi::worker_set_ctx_exports(&compiled, &loopback.globals)?;
 
         let pending = pending_link(name, conf, bindings, loopback, report).map_err(capnp_error)?;
+        let rebuild_group = factory.platform().rebuild_group(name).map(str::to_owned);
 
         let this = Rc::new(Self {
             factory,
@@ -241,6 +247,7 @@ impl WorkerService {
             channels: RefCell::new(None),
             namespaces: RefCell::new(LinkedHashMap::new()),
             broken: Cell::new(false),
+            rebuild: Rebuild::new(rebuild_group),
         });
         this.init_namespaces(local_actor_configs);
         Ok(this)
@@ -322,6 +329,8 @@ impl WorkerService {
         .map_err(capnp_error)?;
         ffi::worker_set_ctx_exports(&compiled, &loopback.globals)?;
 
+        // A dynamic worker is never rebuilt (`worker_rebuildable`), and is in no group.
+        let rebuild = Rebuild::new(None);
         let this = Rc::new(Self {
             factory,
             service_name: None,
@@ -336,6 +345,7 @@ impl WorkerService {
             channels: RefCell::new(None),
             namespaces: RefCell::new(LinkedHashMap::new()),
             broken: Cell::new(false),
+            rebuild,
         });
 
         let subrequest = loopback
@@ -521,6 +531,27 @@ impl WorkerService {
     #[must_use]
     pub fn factory(&self) -> &Rc<Factory> {
         &self.factory
+    }
+
+    /// The compiled worker.
+    #[must_use]
+    pub fn compiled(&self) -> &ffi::CompiledWorker {
+        &self.worker
+    }
+
+    /// When the worker is built again after its isolate went over its memory limit.
+    #[must_use]
+    pub fn rebuild(&self) -> &Rebuild {
+        &self.rebuild
+    }
+
+    /// Resolves once the worker can take a new request or construct a new actor: at once, or
+    /// when the build that replaces a condemned isolate ends (`rebuild.rs`).
+    pub async fn when_ready(self: &Rc<Self>) -> Result<()> {
+        match self.rebuild.when_ready(self) {
+            Some(build) => build.await,
+            None => self.rebuild.failure(&self.worker).map_or(Ok(()), Err),
+        }
     }
 
     /// The service's config name, which restores a stub to the worker. A dynamic worker has
@@ -753,8 +784,12 @@ impl WorkerService {
     /// Starts a request on `entrypoint` (the default when `None`), on `actor` if the entrypoint
     /// is a Durable Object class. `is_tracer` marks a request that is itself a tail worker's,
     /// which gets no tail workers of its own.
+    ///
+    /// A Durable Object's event runs in the worker the object was constructed in; any other
+    /// request waits for a worker whose isolate is not condemned (`rebuild.rs`), or fails as the
+    /// last build to make one did.
     pub fn start_request(
-        &self,
+        self: &Rc<Self>,
         entrypoint: Option<&str>,
         props: Option<KjOwn<Frankenvalue>>,
         actor: Option<&ffi::ActorHandle>,
@@ -763,6 +798,20 @@ impl WorkerService {
     ) -> Result<KjOwn<WorkerInterface>> {
         if self.broken.get() {
             return Err(invalid_config_error());
+        }
+        if actor.is_none() {
+            if let Some(build) = self.rebuild.when_ready(self) {
+                let this = Rc::clone(self);
+                let entrypoint = entrypoint.map(str::to_owned);
+                return Ok(PromisedInterface::new(async move {
+                    build.await?;
+                    this.start_request(entrypoint.as_deref(), props, None, metadata, is_tracer)
+                })
+                .into_kj());
+            }
+            if let Some(failure) = self.rebuild.failure(&self.worker) {
+                return Ok(PromisedInterface::new(async move { Err(failure) }).into_kj());
+            }
         }
         let channels = self.channels()?;
 
@@ -787,7 +836,11 @@ impl WorkerService {
     }
 
     /// Starts the worker's tails, buffered and streaming, for one of its events.
-    fn start_tails(&self, channels: &LinkedChannels, is_tracer: bool) -> Result<Vec<Tail>> {
+    fn start_tails(
+        self: &Rc<Self>,
+        channels: &LinkedChannels,
+        is_tracer: bool,
+    ) -> Result<Vec<Tail>> {
         let mut tails = Vec::new();
         for (list, streaming) in [(&channels.tails, false), (&channels.streaming_tails, true)] {
             for tail in list {
@@ -807,7 +860,7 @@ impl WorkerService {
     /// when the event being tailed is already a tracer's: a worker tailing itself must not
     /// recurse. Only the direct self-reference is caught; a cycle through another worker is not.
     fn start_tail(
-        &self,
+        self: &Rc<Self>,
         tail: &Rc<dyn Channel>,
         is_tracer: bool,
     ) -> Result<Option<KjOwn<WorkerInterface>>> {
@@ -816,7 +869,7 @@ impl WorkerService {
             // A tail worker that cannot handle requests is skipped rather than failing the
             // request it tails.
             Some(target) if target.worker.broken.get() => Ok(None),
-            Some(target) if ptr::eq(target.worker, self) => {
+            Some(target) if ptr::eq(target.worker, &**self) => {
                 if is_tracer {
                     return Ok(None);
                 }
@@ -922,6 +975,11 @@ struct ActorClassImpl {
 }
 
 impl ActorClass for ActorClassImpl {
+    /// A new actor is constructed in a worker whose isolate is not condemned (`rebuild.rs`).
+    fn when_ready(&self) -> LocalBoxFuture<'_, Result<()>> {
+        Box::pin(self.worker.when_ready())
+    }
+
     fn new_actor(&self, request: NewActor<'_>) -> Result<KjOwn<ffi::ActorHandle>> {
         if self.worker.broken.get() {
             return Err(invalid_config_error());

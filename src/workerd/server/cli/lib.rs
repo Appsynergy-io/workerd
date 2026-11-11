@@ -17,6 +17,7 @@ mod bridge;
 mod config;
 mod deploy;
 mod deployments;
+mod platform;
 mod process;
 mod socket_fd;
 mod watch;
@@ -623,6 +624,11 @@ fn serve_options<T: CommandFactory>(
         socket_fds.insert(name, duplicate);
         inherited.push(socket);
     }
+    let platform = platform_config::<T>(
+        &serve.platform_config,
+        &serve.platform_config_fd,
+        serve_or_test,
+    );
     let control = serve.control_fd.map(|fd| {
         socket_fd::control_file(fd)
             .unwrap_or_else(|error| usage_error::<T>(format!("--control-fd={fd}: {error}")))
@@ -634,9 +640,40 @@ fn serve_options<T: CommandFactory>(
         debug_port: serve.debug_port,
         cluster_address: serve.cluster_address,
         cluster_advertise: serve.cluster_advertise,
+        platform,
         ..run_options(serve_or_test)
     };
     (options, inherited)
+}
+
+/// `--platform-config` or `--platform-config-fd`, decoded; none when neither is given.
+fn platform_config<T: CommandFactory>(
+    paths: &[String],
+    fds: &[u32],
+    serve_or_test: &args::ServeOrTestArgs,
+) -> Option<Vec<u64>> {
+    let (source, flag) = match (paths, fds) {
+        ([], []) => return None,
+        ([path], []) => (
+            platform::Source::File(path),
+            format!("--platform-config={path}"),
+        ),
+        ([], [_]) if serve_or_test.watch => usage_error::<T>(
+            "--platform-config-fd and --watch cannot be combined: a restart could not read the \
+             settings again.",
+        ),
+        ([], [fd]) => (
+            platform::Source::Descriptor(*fd),
+            format!("--platform-config-fd={fd}"),
+        ),
+        _ => usage_error::<T>(
+            "--platform-config and --platform-config-fd are given more than once between them",
+        ),
+    };
+    Some(
+        platform::read(&source)
+            .unwrap_or_else(|error| usage_error::<T>(format!("{flag}: {error}"))),
+    )
 }
 
 /// The options `serve`, `test` and `bench` share: `--directory-path`, `--external-addr` and

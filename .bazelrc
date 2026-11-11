@@ -58,6 +58,11 @@ build:unix --features=skip_virtual_includes --host_features=skip_virtual_include
 # fine otherwise.
 build --cc_include_scanning
 
+# AppSynergy: one pointer-compression cage per isolate group, so each Worker from the config
+# allocates its heap in a cage of its own (src/workerd/server/factory/apsy-limit-enforcers.c++
+# CAGE_HEAP_BUDGET_BYTES).
+build --@v8//:v8_enable_pointer_compression_shared_cage=False
+
 # Forward compatibility with future Bazel versions:
 # Disable deprecated cfg = "host" Bazel rule setting. Blocked on perfetto.
 # common --incompatible_disable_starlark_host_transitions

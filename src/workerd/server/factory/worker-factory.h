@@ -7,9 +7,10 @@
 // The worker factory: the part of workerd's server that needs the isolate, kept in C++ and driven
 // by the Rust server through the cxx bridge in server/bridge.rs. It compiles workers, starts
 // requests on them, constructs actors and their storage, speaks the capnp RPC protocols, encodes
-// channel tokens and runs the inspector. Policy that is workerd's alone (the unlimited
-// LimitEnforcer, the clock-corrected TimerChannel, the null IsolateLimitEnforcer, the default
-// observers) lives here too: the production runtime supplies its own.
+// channel tokens and runs the inspector. Policy that is workerd's alone (the clock-corrected
+// TimerChannel, the null IsolateLimitEnforcer of a dynamic Worker, the default observers) lives here
+// too: the production runtime supplies its own. A Worker the platform's settings give `limits`
+// (apsy.capnp, `--platform-config`) runs under the limits of apsy-limit-enforcers.h.
 //
 // Every function the bridge declares is a free function in this namespace taking the object as its
 // first argument, and is documented on its declaration there. One that can throw is declared
@@ -180,6 +181,7 @@ class WorkerFactory final: private ChannelTokenHandler::Resolver {
 const kj::HttpHeaderTable& factory_header_table(const WorkerFactory& factory);
 bool factory_experimental(const WorkerFactory& factory);
 bool factory_tail_workers(const WorkerFactory& factory);
+void factory_set_platform(const WorkerFactory& factory, ::rust::Slice<const uint64_t> platform);
 void factory_set_server(const WorkerFactory& factory, ::rust::Box<ServerHandle> server);
 void factory_spawn(const WorkerFactory& factory, ::rust::Box<SpawnedTask> task);
 void factory_clear_tasks(const WorkerFactory& factory);
@@ -211,6 +213,9 @@ class CompiledWorker final {
 WorkerInfo worker_info(const CompiledWorker& worker);
 void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
 void worker_unlink(const CompiledWorker& worker);
+void worker_rebuild(const CompiledWorker& worker);
+bool worker_condemned(const CompiledWorker& worker);
+bool worker_rebuildable(const CompiledWorker& worker);
 kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
     kj::Maybe<::rust::Str> entrypoint,
     kj::Maybe<kj::Own<Frankenvalue>> props,
@@ -446,6 +451,11 @@ kj::Own<kj::HttpHeaders> edit_headers(const kj::HttpHeaderTable& table,
 kj::Own<kj::HttpService::Response> new_rewriting_response(kj::HttpService::Response& inner,
     const kj::HttpHeaderTable& table,
     ::rust::Slice<const HeaderEdit> edits);
+kj::Own<kj::HttpService::Response> new_listener_response(kj::HttpService::Response& inner,
+    const kj::HttpHeaderTable& table,
+    ::rust::Slice<const HeaderEdit> edits);
+kj::Promise<uint32_t> listener_response_answer_error(
+    kj::HttpService::Response& response, const AbortReason& error);
 kj::Own<kj::HttpService::ConnectResponse> new_null_connect_response();
 kj::Own<kj::WebSocketErrorHandler> new_jsgify_websocket_errors();
 kj::Own<WorkerInterface::CustomEvent> new_udp_connect_event(

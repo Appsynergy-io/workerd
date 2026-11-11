@@ -63,6 +63,36 @@ pub fn control_file(fd: u32) -> io::Result<std::fs::File> {
     inherited.try_clone_to_owned().map(std::fs::File::from)
 }
 
+/// What descriptor `fd` holds, read to its end, at most `max_bytes` (more is an error); the
+/// descriptor is then closed. `--platform-config-fd`.
+pub fn read_descriptor(fd: u32, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+
+    let raw = i32::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
+    // A number that is not open fails here, before anything takes ownership of it.
+    // SAFETY: fcntl with integer arguments only.
+    if unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor the command line named, open, which nothing else in this process
+    // uses; it is closed when `file` drops.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    (&mut file).take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("holds more than {max_bytes} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Whether the socket is listening, or `None` where the OS cannot say (macOS has no
 /// `SO_ACCEPTCONN`; the server finds out at the first `accept()`).
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]

@@ -528,8 +528,8 @@ impl Handler for HttpConnection {
                 .as_deref()
                 .map_or(headers, HeadersRef::from);
             let mut response =
-                bridge::rewriting_response(response.into_ffi(), table, rewriter.response_edits())?;
-            worker
+                bridge::listener_response(response.into_ffi(), table, rewriter.response_edits())?;
+            let result = worker
                 .request(
                     method,
                     rewritten.url.as_bytes(),
@@ -537,7 +537,22 @@ impl Handler for HttpConnection {
                     body,
                     ServiceResponse::from(response.as_mut()),
                 )
-                .await
+                .await;
+            // A Worker over its limits is Error 1102 and one whose JavaScript threw is Error 1101
+            // (`ffi::listener_response_answer_error`); any other failure gets kj-hyper's bare 500.
+            match result {
+                Err(error) if error.exception_type() != KjExceptionType::Disconnected => {
+                    match bridge::answer_platform_error(&mut response, &error).await? {
+                        1102 => Ok(()),
+                        1101 => {
+                            log_uncaught(&error);
+                            Ok(())
+                        }
+                        _ => Err(error),
+                    }
+                }
+                result => result,
+            }
         }
         .await
         .inspect_err(log_uncaught)

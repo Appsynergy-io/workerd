@@ -38,6 +38,8 @@ pub struct InProcessServer {
     listeners: RefCell<HashMap<String, Rc<LoopbackListener>>>,
     /// The services marked as coming from deployments for the next run.
     deployments: RefCell<Deployments>,
+    /// The platform's settings for the next run (`--platform-config`), as an encoded message.
+    platform: RefCell<Option<Vec<u64>>>,
 }
 
 pub fn new_in_process_server(factory: KjOwn<ffi::WorkerFactory>) -> Box<InProcessServer> {
@@ -53,6 +55,7 @@ pub fn new_in_process_server(factory: KjOwn<ffi::WorkerFactory>) -> Box<InProces
         drain: Notify::new(),
         listeners: RefCell::default(),
         deployments: RefCell::default(),
+        platform: RefCell::default(),
     })
 }
 
@@ -94,6 +97,12 @@ impl InProcessServer {
         deployments.skipped.insert(service.to_owned(), deployment);
     }
 
+    /// Gives the next run the platform's settings (`--platform-config`), an encoded apsy.capnp
+    /// `Platform` message.
+    pub fn set_platform(&self, platform: &[u64]) {
+        *self.platform.borrow_mut() = Some(platform.to_vec());
+    }
+
     /// The next config error or warning the server reports.
     pub async fn next_report(&self) -> ffi::ConfigReport {
         // The borrow lasts one poll. The sender is this server's, so the channel never closes.
@@ -107,6 +116,7 @@ impl InProcessServer {
     pub async fn run(&self, debug_port: &str) -> Result<()> {
         let options = RunOptions {
             debug_port: (!debug_port.is_empty()).then(|| debug_port.to_owned()),
+            platform: self.platform.borrow().clone(),
             ..RunOptions::default()
         };
         let factory = Rc::clone(&self.factory);

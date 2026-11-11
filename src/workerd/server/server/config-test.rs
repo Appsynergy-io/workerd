@@ -508,3 +508,23 @@ fn a_deployments_warnings_and_broken_services_are_attributed_to_it() {
         ]
     );
 }
+
+#[test]
+fn a_service_error_is_one_line_and_reaches_the_forwarded_sink_unescaped() {
+    let (report, errors) = collecting_reporter();
+    let forwarded = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&forwarded);
+    report.forward_service_errors(Box::new(move |service, error| {
+        sink.borrow_mut()
+            .push((service.to_owned(), error.to_owned()));
+    }));
+    report.service_error("a", "first\nservice b: forged\r");
+    assert_eq!(
+        *errors.borrow(),
+        vec!["service a: first\\nservice b: forged\\r".to_owned()]
+    );
+    assert_eq!(
+        *forwarded.borrow(),
+        vec![("a".to_owned(), "first\nservice b: forged\r".to_owned())]
+    );
+}

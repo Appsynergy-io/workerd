@@ -35,6 +35,7 @@ wd_rust_crate(
         "//src/workerd/io:bench_capnp_rust",
         "//src/workerd/io:outcome_capnp_rust",
         "//src/workerd/server:compiled-bindings_capnp_rust",
+        "//src/workerd/server:apsy_capnp_rust",
         "//src/workerd/server:workerd_capnp_rust",
         "//src/workerd/server/cluster",
         "//src/workerd/server/cluster/logic:cluster-logic",

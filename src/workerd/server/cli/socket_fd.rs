@@ -43,3 +43,4 @@ mod imp;
 
 pub use imp::InheritedSocket;
 pub use imp::control_file;
+pub use imp::read_descriptor;

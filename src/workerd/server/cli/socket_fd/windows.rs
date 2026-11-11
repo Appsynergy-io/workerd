@@ -79,3 +79,11 @@ fn is_listener(fd: u32) -> Result<Option<bool>, Error> {
     }
     Ok(Some(acceptcon != 0))
 }
+
+/// `--platform-config-fd`: Unix only; `--platform-config` takes a file on every platform.
+pub fn read_descriptor(_fd: u32, _max_bytes: usize) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "--platform-config-fd is implemented on Unix only",
+    ))
+}

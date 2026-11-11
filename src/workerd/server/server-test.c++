@@ -4,6 +4,7 @@
 
 #include <workerd/jsg/jsg-test.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/apsy.capnp.h>
 #include <workerd/server/factory/worker-factory.h>
 #include <workerd/server/server/bridge.rs.h>
 #include <workerd/util/autogate.h>
@@ -427,6 +428,13 @@ class Server: public kj::PtrTarget {
   void addSkippedDeploymentService(kj::StringPtr deployment, kj::StringPtr service) {
     skippedDeploymentServices.add(kj::str(deployment), kj::str(service));
   }
+  // AppSynergy: the platform's settings, as `--platform-config` gives them: one apsy.capnp
+  // `Platform` struct literal.
+  void setPlatform(kj::StringPtr text) {
+    capnp::MallocMessageBuilder message;
+    TEXT_CODEC.decode(text, message.initRoot<apsy::Platform>());
+    platformWords = capnp::messageToFlatArray(message);
+  }
 
   kj::Promise<void> run(jsg::V8System& v8System,
       config::Config::Reader config,
@@ -507,6 +515,7 @@ class Server: public kj::PtrTarget {
   kj::Function<void(kj::String)> reportConfigError;
   kj::Function<void(kj::String)> reportConfigWarning;
   kj::Vector<std::pair<kj::String, kj::String>> deploymentServices;
+  kj::Maybe<kj::Array<capnp::word>> platformWords;
   kj::Vector<std::pair<kj::String, kj::String>> skippedDeploymentServices;
   kj::Maybe<::rust::Box<InProcessServer>> server;
 
@@ -530,6 +539,10 @@ class Server: public kj::PtrTarget {
     for (auto& [deployment, service]: skippedDeploymentServices) {
       started.add_skipped_deployment_service(deployment.asPtr().as<kj_rs::RustUncheckedUtf8>(),
           service.asPtr().as<kj_rs::RustUncheckedUtf8>());
+    }
+    KJ_IF_SOME(words, platformWords) {
+      started.set_platform(::rust::Slice<const uint64_t>(
+          reinterpret_cast<const uint64_t*>(words.begin()), words.size()));
     }
     return started;
   }
@@ -2973,7 +2986,7 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
     test.start();
   }
 
-  // However, a request will still fail at runtime.
+  // However, a request will still fail at runtime, as the Worker throwing: Error 1101.
   KJ_EXPECT_LOG(ERROR, "no such actor class");
   KJ_EXPECT_LOG(INFO, "internal error");
   KJ_EXPECT_LOG(INFO, "internal error");
@@ -2983,10 +2996,157 @@ KJ_TEST("Server: configuring a DO namespace with no class export is not an error
   conn.sendHttpGet("/");
   conn.recv(R"(
     HTTP/1.1 500 Internal Server Error
-    Connection: close
-    Content-Length: 21
+    Content-Length: 22
+    Content-Type: text/plain; charset=utf-8
+    cf-error-type: 1101
+    cf-error-origin: Workers runtime
 
-    Internal Server Error)"_blockquote);
+    Worker threw exception)"_blockquote);
+}
+
+// AppSynergy: a Worker the platform's settings give `limits` (apsy.capnp, `--platform-config`) is
+// held to its CPU time, and a visitor is answered Error 1102 for it
+// [https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1102/].
+// Without settings the same Worker is not limited.
+KJ_TEST("Server: a Worker over its CPU limit is answered 1102") {
+  TestServer test(R"((
+    services = [
+      ( name = "spin",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    if (new URL(request.url).pathname == "/spin") for (;;) {}
+              `    return new Response("ok");
+              `  }
+              `}
+          )]
+        )
+      )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "spin")]
+  ))"_kj);
+  test.server.setPlatform(R"((
+    services = [(name = "spin", limits = (cpuMs = 10))],
+    cpuRolloverInitialMs = 0
+  ))");
+
+  test.start();
+  test.connect("test-addr").httpGet200("/", "ok");
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/spin");
+  conn.recv(R"(
+    HTTP/1.1 503 Service Unavailable
+    Content-Length: 31
+    Content-Type: text/plain; charset=utf-8
+    cf-error-type: 1102
+    cf-error-origin: Workers runtime
+
+    Worker exceeded resource limits)"_blockquote);
+}
+
+// AppSynergy: `Limits.memoryBytes` holds a Worker's isolate to that much memory (Cloudflare's 128
+// MB, https://developers.cloudflare.com/workers/platform/limits/#memory), and a visitor is
+// answered 1102 for an invocation past it. A Worker the settings list with other limits but no
+// memoryBytes, and one they do not list, run the same code unlimited.
+KJ_TEST("Server: a Worker with memoryBytes is held to it, one without is not") {
+  TestServer test(R"((
+    services = [
+      ( name = "capped",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    let held = [];
+              `    for (let i = 0; i < 48; i++) held.push(new Array(131072).fill(i + 0.5));
+              `    return new Response("grown " + held.length);
+              `  }
+              `}
+          )]
+        )
+      ),
+      ( name = "listed",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    let held = [];
+              `    for (let i = 0; i < 48; i++) held.push(new Array(131072).fill(i + 0.5));
+              `    return new Response("grown " + held.length);
+              `  }
+              `}
+          )]
+        )
+      ),
+      ( name = "unlisted",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(
+            name = "main.js",
+            esModule =
+              `export default {
+              `  async fetch(request) {
+              `    let held = [];
+              `    for (let i = 0; i < 48; i++) held.push(new Array(131072).fill(i + 0.5));
+              `    return new Response("grown " + held.length);
+              `  }
+              `}
+          )]
+        )
+      )
+    ],
+    sockets = [
+      (name = "capped", address = "capped-addr", service = "capped"),
+      (name = "listed", address = "listed-addr", service = "listed"),
+      (name = "unlisted", address = "unlisted-addr", service = "unlisted")
+    ]
+  ))"_kj);
+  test.server.setPlatform(R"((
+    services = [
+      (name = "capped", limits = (memoryBytes = 16777216)),
+      (name = "listed", limits = (cpuMs = 0))
+    ]
+  ))");
+
+  test.start();
+  test.connect("listed-addr").httpGet200("/", "grown 48");
+  test.connect("unlisted-addr").httpGet200("/", "grown 48");
+  auto conn = test.connect("capped-addr");
+  conn.sendHttpGet("/");
+  conn.recv(R"(
+    HTTP/1.1 503 Service Unavailable
+    Content-Length: 31
+    Content-Type: text/plain; charset=utf-8
+    cf-error-type: 1102
+    cf-error-origin: Workers runtime
+
+    Worker exceeded resource limits)"_blockquote);
+}
+
+KJ_TEST("Server: the platform's settings name only the config's Workers") {
+  TestServer test(R"((
+    services = [
+      ( name = "main",
+        worker = (
+          compatibilityDate = "2024-01-01",
+          modules = [(name = "main.js", esModule = "export default {}")]
+        )
+      )
+    ]
+  ))"_kj);
+  test.server.setPlatform(R"((services = [(name = "absent", limits = (cpuMs = 10))]))");
+  test.expectErrors(R"(
+    --platform-config names service "absent", which the config does not define as a Worker.
+  )"_blockquote);
 }
 
 KJ_TEST("Server: named images and directory snapshots are not startup sources") {
@@ -9240,8 +9400,10 @@ KJ_TEST("Server: transpiled typescript failure") {
   ))"_kj));
   test.server.allowExperimental();
 
-  test.expectErrors(R"(service hello: Error transpiling main.ts : Unsupported syntax
-    TypeScript enum is not supported in strip-only mode
+  // One report is one line: the break before the diagnostic is written escaped, so the expected
+  // text holds a backslash and an n where upstream's holds a line break.
+  test.expectErrors(
+      R"(service hello: Error transpiling main.ts : Unsupported syntax\n    TypeScript enum is not supported in strip-only mode
 service hello: Uncaught TypeError: Main module must be an ES module.
 )");
 }

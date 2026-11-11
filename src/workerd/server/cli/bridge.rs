@@ -33,6 +33,7 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("workerd/server/factory/bootstrap.h");
         include!("workerd/server/config-compiler.h");
+        include!("workerd/server/apsy-platform-config.h");
 
         /// Compiles a config written as a Cap'n Proto schema file. Every file it is about to read
         /// is first registered with `process.watch_file()`, so `--watch` cannot miss a change
@@ -45,6 +46,10 @@ pub mod ffi {
             const_name: KjMaybe<&str>,
             process: &Process,
         ) -> Result<CompiledConfig>;
+
+        /// AppSynergy: `--platform-config`'s text, one apsy.capnp `Platform` struct literal, as an
+        /// encoded message in 8-byte words. Fails with the text parser's message.
+        fn decode_platform_config(text: &str) -> Result<Vec<u64>>;
 
         /// The release date this binary was built from, as ASCII.
         fn release_version() -> &'static [u8];

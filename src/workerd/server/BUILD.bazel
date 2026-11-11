@@ -83,9 +83,15 @@ wd_rust_crate(
     srcs = glob(["cli/**/*.rs"]),
     crate_root = "cli/lib.rs",
     cxx_bridge_deps = ["//src/workerd/server/factory:bootstrap-hdrs"],
-    cxx_bridge_hdrs = ["config-compiler.h"],
+    cxx_bridge_hdrs = [
+        "apsy-platform-config.h",
+        "config-compiler.h",
+    ],
     cxx_bridge_src = "cli/bridge.rs",
-    link_deps = [":config-compiler"],
+    link_deps = [
+        ":apsy-platform-config",
+        ":config-compiler",
+    ],
     test_compile_data = ["//samples:wrangler/wrangler.jsonc"],
     deps = [
         ":workerd_capnp_rust",
@@ -117,6 +123,20 @@ wd_cc_library(
         ":cli/bridge.rs@cxx",
         ":schema-file",
         ":workerd_capnp",
+        "//src/rust/cxx/kj-rs",
+        "@capnp-cpp//src/capnp:capnpc",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+# AppSynergy: decodes `--platform-config`'s text (apsy.capnp) for the command line (:workerd-cli).
+wd_cc_library(
+    name = "apsy-platform-config",
+    srcs = ["apsy-platform-config.c++"],
+    hdrs = ["apsy-platform-config.h"],
+    linkstatic = CC_LIBRARY_LINKSTATIC,
+    deps = [
+        ":apsy_capnp",
         "//src/rust/cxx/kj-rs",
         "@capnp-cpp//src/capnp:capnpc",
         "@capnp-cpp//src/kj",
@@ -272,6 +292,9 @@ wd_cc_library(
 
 wd_capnp_library(src = "docker-api.capnp")
 
+# AppSynergy: the platform's settings, `--platform-config` (apsy.capnp).
+wd_capnp_library(src = "apsy.capnp")
+
 wd_capnp_library(
     src = "compiled-bindings.capnp",
     deps = [":workerd_capnp"],
@@ -392,6 +415,7 @@ kj_test(
         "//conditions:default": [],
     }),
     deps = [
+        ":apsy_capnp",
         "//src/rust/cxx/kj-rs-io:kj-rs-io-lib",
         "//src/workerd/server/factory:worker-factory",
         "//src/workerd/server/server:workerd-server",

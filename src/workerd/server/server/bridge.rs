@@ -12,7 +12,7 @@
 
 #![allow(
     unsafe_code,
-    reason = "holds the cxx bridge, which expands to unsafe FFI glue, and `rewriting_response`, the safe wrapper over the bridge's `unsafe fn new_rewriting_response`"
+    reason = "holds the cxx bridge, which expands to unsafe FFI glue, and the safe wrappers over the bridge's unsafe fns (`rewriting_response`, `listener_response`)"
 )]
 
 pub use crate::actor::MovedHook;
@@ -326,6 +326,10 @@ pub mod ffi {
         /// Whether requests get tail workers (`WorkerFactory::Options::tailWorkers`): not under
         /// `workerd bench`, unless given `--trace`.
         fn factory_tail_workers(factory: &WorkerFactory) -> bool;
+        /// AppSynergy: the platform's settings for the run about to start (apsy.capnp `Platform`,
+        /// `--platform-config`) as an encoded message in words; empty for none. Before any worker
+        /// is compiled: a Worker's limits are read when it is.
+        fn factory_set_platform(factory: &WorkerFactory, platform: &[u64]) -> Result<()>;
         /// Registers the server as the resolver of channel tokens and debug-port requests.
         /// Tokens cannot be decoded before this.
         fn factory_set_server(factory: &WorkerFactory, server: Box<ServerHandle>);
@@ -371,6 +375,19 @@ pub mod ffi {
         /// channels; and drops a dynamic worker's env channel tables and tails, which may refer
         /// back to the worker that loaded it. Called when the server unlinks the worker.
         fn worker_unlink(worker: &CompiledWorker);
+        /// Whether the worker's isolate is condemned: it has held more than its memory limit, and
+        /// the next request belongs in a new isolate (factory/apsy-limit-enforcers.h).
+        fn worker_condemned(worker: &CompiledWorker) -> bool;
+        /// Whether `worker_rebuild` can build the worker again: a config worker whose
+        /// construction is self-contained (the legacy module registry, not Python, no module
+        /// fallback, no inspector).
+        fn worker_rebuildable(worker: &CompiledWorker) -> bool;
+        /// Builds the worker again, in a new isolate, from the config, `env` and `ctx.exports` it
+        /// was first built from, and starts every later request in it; requests and actors already
+        /// running finish in the one they hold. Fails with the build's errors, or the memory error
+        /// when its startup alone condemns the new isolate. Runs on the event loop, never under
+        /// another isolate's lock.
+        fn worker_rebuild(worker: &CompiledWorker) -> Result<()>;
         /// Starts a request on the worker. `channels` is the worker's I/O channel table for this
         /// request; `tails` receive the request's trace once it completes (the server passes none
         /// for a request that is itself a tail worker's, so that tails do not trace themselves,
@@ -689,6 +706,24 @@ pub mod ffi {
             table: &HttpHeaderTable,
             edits: &[HeaderEdit],
         ) -> Result<KjOwn<HttpServiceResponse>>;
+        /// The response of a request an HTTP socket received: `edits` applied as
+        /// `new_rewriting_response` applies them, the Worker's own `cf-error-type` and
+        /// `cf-error-origin` dropped (they name an error the platform generated), and the
+        /// platform's errors answered (`listener_response_answer_error`). Borrows `inner` for its
+        /// life.
+        unsafe fn new_listener_response<'a>(
+            inner: Pin<&'a mut HttpServiceResponse>,
+            table: &HttpHeaderTable,
+            edits: &[HeaderEdit],
+        ) -> Result<KjOwn<HttpServiceResponse>>;
+        /// Answers `error`, the request's failure, on `response` (one `new_listener_response`
+        /// made) as the platform error it is, if nothing was sent yet: Error 1102 for a Worker
+        /// over its CPU or memory limit, Error 1101 for an exception its JavaScript threw. The
+        /// error's number, or 0 when it answered nothing.
+        async fn listener_response_answer_error(
+            response: Pin<&mut HttpServiceResponse>,
+            error: &AbortReason,
+        ) -> Result<u32>;
         /// The `ConnectResponse` of a raw TCP socket's `connect()`: accepting does nothing,
         /// rejecting discards the body.
         fn new_null_connect_response() -> KjOwn<ConnectResponse>;
@@ -774,6 +809,8 @@ pub mod ffi {
         fn drain(self: &InProcessServer);
         fn add_deployment_service(self: &InProcessServer, deployment: &str, service: &str);
         fn add_skipped_deployment_service(self: &InProcessServer, deployment: &str, service: &str);
+        /// AppSynergy: the platform's settings for the next run, an encoded apsy.capnp `Platform`.
+        fn set_platform(self: &InProcessServer, platform: &[u64]);
         async unsafe fn next_report<'a>(self: &'a InProcessServer) -> ConfigReport;
         fn connect(self: &InProcessServer, name: &str) -> Result<KjOwn<AsyncIoStream>>;
         async unsafe fn accept<'a>(
@@ -1054,6 +1091,29 @@ pub fn rewriting_response<'a>(
         response,
         _inner: std::marker::PhantomData,
     })
+}
+
+/// See `ffi::new_listener_response`. Borrows `inner` for its life, as `RewritingResponse` does.
+pub fn listener_response<'a>(
+    inner: std::pin::Pin<&'a mut ffi::HttpServiceResponse>,
+    table: &ffi::HttpHeaderTable,
+    edits: &[ffi::HeaderEdit],
+) -> crate::Result<RewritingResponse<'a>> {
+    // SAFETY: the returned wrapper carries `inner`'s lifetime, so it cannot outlive it.
+    let response = unsafe { ffi::new_listener_response(inner, table, edits) }?;
+    Ok(RewritingResponse {
+        response,
+        _inner: std::marker::PhantomData,
+    })
+}
+
+/// See `ffi::listener_response_answer_error`; `response` is one `listener_response` made.
+pub async fn answer_platform_error(
+    response: &mut RewritingResponse<'_>,
+    error: &crate::Error,
+) -> crate::Result<u32> {
+    let reason = AbortReason(Some(error.clone()));
+    Ok(ffi::listener_response_answer_error(response.as_mut(), &reason).await?)
 }
 
 /// See `ffi::exception_throw`.
